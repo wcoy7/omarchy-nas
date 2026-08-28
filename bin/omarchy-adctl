@@ -6,14 +6,22 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 STATE_PATH = Path("/etc/omarchy-ad/state.json")
 SMB_CONF = Path("/etc/samba/smb.conf")
 KEA_CONF = Path("/etc/kea/kea-dhcp4.conf")
+GARAGE_CONF = Path("/etc/garage.toml")
+GARAGE_DATA = Path("/var/lib/garage")
+GARAGE_UNIT = "garage.service"
+S3_PORT = 3900
+RPC_PORT = 3901
+ADMIN_PORT = 3903
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -26,8 +34,11 @@ def need_root() -> None:
         die("need root (use pkexec)")
 
 
-HELPER_VERSION = "1.2.4"
+HELPER_VERSION = "1.3.0"
 KEA_UNITS = ("kea-dhcp4.service", "kea-dhcp4-server.service")
+# Arch extra ships garage 2.3: /usr/bin/garage, garage.service (User=garage),
+# /etc/garage.toml. CLI verified against v2.3.0 structs.rs: `key create`,
+# `bucket allow --key`, `bucket delete --yes`, `layout apply --version`.
 
 
 def run(cmd: list[str], check: bool = True, timeout: int = 20) -> subprocess.CompletedProcess:
@@ -73,6 +84,7 @@ def load_state() -> dict:
         "mode": "",
         "dhcp_enabled": True,
         "dns_enabled": True,
+        "garage_enabled": False,
         "primary": {},
         "vlans": [],
         "hosts": [],
@@ -182,7 +194,7 @@ def pkg_installed(name: str) -> bool:
     return r.returncode == 0
 
 
-def package_catalog(mode: str, dhcp_on: bool) -> list[dict]:
+def package_catalog(mode: str, dhcp_on: bool, garage_on: bool = False) -> list[dict]:
     rows = [
         ("samba", True, "File shares and directory", True),
         ("wsdd", True, "Windows Network Neighborhood discovery", True),
@@ -196,6 +208,7 @@ def package_catalog(mode: str, dhcp_on: bool) -> list[dict]:
         ("kea-docs", dhcp_on, "Kea docs", False),
         ("bind", mode == "host-ad", "host/dig for DNS checks", False),
         ("restic", mode == "host-ad", "AD backups to B2", False),
+        ("garage", garage_on, "S3-compatible object store (Deuxfleurs Garage)", True),
     ]
     out = []
     for name, applies, why, required in rows:
@@ -216,7 +229,11 @@ def cmd_packages_install(_args: list[str]) -> None:
     need_root()
     state = load_state()
     mode = detect_mode(state)
-    catalog = package_catalog(mode, bool(state.get("dhcp_enabled", True)))
+    catalog = package_catalog(
+        mode,
+        bool(state.get("dhcp_enabled", True)),
+        bool(state.get("garage_enabled", False)),
+    )
     missing = [p["name"] for p in catalog if p["missing"]]
     if not missing:
         print(json.dumps({"ok": True, "installed": []}))
@@ -294,6 +311,383 @@ def list_users(mode: str) -> list:
     return users
 
 
+def garage_bin() -> str:
+    for p in ("/usr/bin/garage", "/usr/local/bin/garage"):
+        if Path(p).is_file():
+            return p
+    from shutil import which
+    return which("garage") or "garage"
+
+
+def garage_run(args: list[str], check: bool = True, timeout: int = 30) -> subprocess.CompletedProcess:
+    cmd = [garage_bin(), "-c", str(GARAGE_CONF), *args]
+    return run(cmd, check=check, timeout=timeout)
+
+
+def log_last_apply(payload: dict) -> None:
+    blob = json.dumps(payload, indent=2) + "\n"
+    logdir = Path("/etc/omarchy-ad")
+    try:
+        logdir.mkdir(parents=True, exist_ok=True)
+        (logdir / "set-services.log").write_text(blob, encoding="utf-8")
+    except OSError:
+        pass
+    tmp = Path("/tmp/omarchy-ad-last-apply.json")
+    try:
+        tmp.write_text(blob, encoding="utf-8")
+        os.chmod(tmp, 0o644)
+    except OSError:
+        pass
+
+
+def parse_kv(args: list[str]) -> dict:
+    spec: dict = {}
+    for a in args:
+        a = str(a)
+        if a.startswith("{") and "}" in a:
+            try:
+                spec.update(json.loads(a))
+            except json.JSONDecodeError:
+                pass
+            continue
+        if "=" in a:
+            k, v = a.split("=", 1)
+            spec[k.strip().lstrip("-")] = v.strip()
+    return spec
+
+
+def s3_endpoint_host(state: dict | None = None) -> str:
+    live = live_ipv4()
+    primary = (state or {}).get("primary") or {}
+    ip = primary.get("ip") or live.get("ip") or "127.0.0.1"
+    return f"{ip}:{S3_PORT}"
+
+
+def garage_secret_is_placeholder(value: str) -> bool:
+    v = (value or "").strip().strip('"')
+    if not v or "GENERATE" in v.upper():
+        return True
+    return not re.fullmatch(r"[0-9a-fA-F]{64}", v)
+
+
+def read_garage_toml_field(text: str, key: str) -> str:
+    m = re.search(rf"^\s*{re.escape(key)}\s*=\s*\"([^\"]*)\"", text, re.M)
+    if m:
+        return m.group(1)
+    m = re.search(rf"^\s*{re.escape(key)}\s*=\s*(\S+)", text, re.M)
+    return (m.group(1) if m else "").strip().strip('"')
+
+
+def garage_conf_needs_init() -> bool:
+    if not GARAGE_CONF.is_file():
+        return True
+    text = GARAGE_CONF.read_text(encoding="utf-8", errors="replace")
+    return garage_secret_is_placeholder(read_garage_toml_field(text, "rpc_secret"))
+
+
+def write_garage_config(state: dict) -> None:
+    """Write /etc/garage.toml on first enable. Keep existing real secrets."""
+    if not garage_conf_needs_init():
+        return
+    live = live_ipv4()
+    primary = state.get("primary") or {}
+    ip = primary.get("ip") or live.get("ip") or "127.0.0.1"
+    rpc_secret = secrets.token_hex(32)
+    admin_token = secrets.token_hex(32)
+    metrics_token = secrets.token_hex(32)
+    body = (
+        "# Written by omarchy-adctl for a single-node office Garage.\n"
+        "# replication_factor = 1 (one node). Do not print secrets in status.\n"
+        "replication_factor = 1\n"
+        'metadata_dir = "/var/lib/garage/meta"\n'
+        'data_dir = "/var/lib/garage/data"\n'
+        'metadata_snapshots_dir = "/var/lib/garage/snapshots"\n'
+        'db_engine = "sqlite"\n'
+        "\n"
+        f'rpc_secret = "{rpc_secret}"\n'
+        f'rpc_bind_addr = "[::]:{RPC_PORT}"\n'
+        f'rpc_public_addr = "{ip}:{RPC_PORT}"\n'
+        "allow_world_readable_secrets = false\n"
+        "\n"
+        "[s3_api]\n"
+        f'api_bind_addr = "[::]:{S3_PORT}"\n'
+        's3_region = "garage"\n'
+        'root_domain = ".s3.garage"\n'
+        "\n"
+        "[admin]\n"
+        f'api_bind_addr = "127.0.0.1:{ADMIN_PORT}"\n'
+        f'admin_token = "{admin_token}"\n'
+        f'metrics_token = "{metrics_token}"\n'
+        "metrics_require_token = true\n"
+    )
+    GARAGE_CONF.parent.mkdir(parents=True, exist_ok=True)
+    GARAGE_CONF.write_text(body, encoding="utf-8")
+    os.chmod(GARAGE_CONF, 0o640)
+    try:
+        import pwd
+        import grp
+        uid = pwd.getpwnam("garage").pw_uid
+        gid = grp.getgrnam("garage").gr_gid
+        os.chown(GARAGE_CONF, uid, gid)
+    except KeyError:
+        pass
+
+
+def ensure_garage_dirs() -> None:
+    for sub in ("", "meta", "data", "snapshots"):
+        path = GARAGE_DATA / sub if sub else GARAGE_DATA
+        path.mkdir(parents=True, exist_ok=True)
+        os.chmod(path, 0o750)
+        try:
+            import pwd
+            import grp
+            uid = pwd.getpwnam("garage").pw_uid
+            gid = grp.getgrnam("garage").gr_gid
+            os.chown(path, uid, gid)
+        except KeyError:
+            pass
+
+
+def ensure_garage_user() -> None:
+    sysusers = Path("/usr/lib/sysusers.d/garage.conf")
+    tmpfiles = Path("/usr/lib/tmpfiles.d/garage.conf")
+    if sysusers.is_file():
+        run(["systemd-sysusers", str(sysusers)], check=False)
+    if tmpfiles.is_file():
+        run(["systemd-tmpfiles", "--create", str(tmpfiles)], check=False)
+    if run(["id", "garage"], check=False).returncode != 0:
+        die("garage system user missing; install the Arch extra package: pacman -S garage")
+
+
+def ensure_garage_installed() -> None:
+    if Path("/usr/bin/garage").is_file():
+        return
+    from shutil import which
+    if which("omarchy-pkg-add"):
+        r = run(["omarchy-pkg-add", "garage"], check=False, timeout=600)
+    else:
+        r = run(["pacman", "-S", "--noconfirm", "--needed", "garage"], check=False, timeout=600)
+    if r.returncode != 0 or not Path("/usr/bin/garage").is_file():
+        err = (r.stderr or r.stdout or "").strip()
+        die(
+            (err + "\n" if err else "")
+            + "Garage is not installed. Arch extra package: pacman -S garage "
+            "(or omarchy-pkg-add garage). Binary builds: https://garagehq.deuxfleurs.fr/download/"
+        )
+
+
+def parse_garage_node_id(text: str) -> str:
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or " " in s.split("@")[0]:
+            continue
+        if re.match(r"^[0-9a-fA-F]{8,}@", s) or re.fullmatch(r"[0-9a-fA-F]{16,}", s):
+            return s.split("@", 1)[0]
+    return ""
+
+
+def garage_node_id() -> str:
+    r = garage_run(["node", "id", "-q"], check=False)
+    nid = parse_garage_node_id(r.stdout or "")
+    if nid:
+        return nid
+    r = garage_run(["status"], check=False)
+    for line in (r.stdout or "").splitlines():
+        parts = line.split()
+        if parts and re.match(r"^[0-9a-fA-F]{8,}", parts[0].rstrip("….")):
+            return parts[0].rstrip("….…")
+    die("could not read garage node id")
+    return ""
+
+
+def garage_layout_version(text: str) -> int:
+    m = re.search(r"layout version:\s*(\d+)", text, re.I)
+    return int(m.group(1)) if m else 0
+
+
+def garage_needs_layout() -> bool:
+    r = garage_run(["status"], check=False)
+    out = (r.stdout or "") + (r.stderr or "")
+    if r.returncode != 0:
+        return True
+    return "NO ROLE ASSIGNED" in out
+
+
+def garage_capacity() -> str:
+    try:
+        st = os.statvfs(str(GARAGE_DATA) if GARAGE_DATA.is_dir() else "/")
+        gb = max(1, (st.f_frsize * st.f_blocks) // (1024 ** 3))
+        return f"{gb}GB"
+    except OSError:
+        return "100GB"
+
+
+def wait_garage(timeout: int = 30) -> None:
+    deadline = time.time() + timeout
+    last = "no output"
+    while time.time() < deadline:
+        r = garage_run(["status"], check=False, timeout=8)
+        if r.returncode == 0 and (r.stdout or "").strip():
+            return
+        last = ((r.stderr or r.stdout or "").strip() or last)
+        time.sleep(1)
+    die("garage did not become ready: " + last.split("\n")[0])
+
+
+def init_garage_layout() -> None:
+    """Idempotent single-node layout, replication_factor 1."""
+    if not garage_needs_layout():
+        return
+    nid = garage_node_id()
+    cap = garage_capacity()
+    staged = garage_run(
+        ["layout", "assign", "-z", "office", "-c", cap, nid],
+        check=False,
+    )
+    if staged.returncode != 0:
+        die((staged.stderr or staged.stdout or "layout assign failed").strip())
+    shown = garage_run(["layout", "show"], check=False)
+    ver = garage_layout_version(shown.stdout or "")
+    nxt = ver + 1 if ver >= 0 else 1
+    if ver == 0:
+        nxt = 1
+    applied = garage_run(["layout", "apply", "--version", str(nxt)], check=False)
+    if applied.returncode != 0:
+        applied = garage_run(["layout", "apply"], check=False)
+    if applied.returncode != 0:
+        err = (applied.stderr or applied.stdout or "").strip()
+        if garage_needs_layout():
+            die(err or "layout apply failed")
+
+
+def parse_garage_bucket_list(text: str) -> list[dict]:
+    buckets: list[dict] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("=") or s.lower().startswith("id"):
+            continue
+        parts = s.split()
+        if not parts:
+            continue
+        bid = parts[0]
+        name = ""
+        for p in parts[1:]:
+            if re.match(r"^\d{4}-\d{2}-\d{2}", p) or re.match(r"^\d{2}:\d{2}", p):
+                continue
+            name = p
+            break
+        buckets.append({"id": bid, "name": name or bid})
+    return buckets
+
+
+def parse_garage_key_list(text: str) -> list[dict]:
+    keys: list[dict] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("=") or s.lower().startswith("id"):
+            continue
+        parts = s.split()
+        if not parts:
+            continue
+        kid = parts[0]
+        mid = []
+        for p in parts[1:]:
+            if re.match(r"^\d{4}-\d{2}-\d{2}", p) or re.match(r"^\d{2}:\d{2}", p):
+                continue
+            mid.append(p)
+        if mid and mid[-1].lower() in ("never", "expired"):
+            mid = mid[:-1]
+        keys.append({"id": kid, "name": " ".join(mid)})
+    return keys
+
+
+def parse_key_create(text: str) -> dict:
+    out = {"key_id": "", "key_name": "", "secret_key": ""}
+    for line in text.splitlines():
+        if ":" not in line:
+            continue
+        k, v = line.split(":", 1)
+        kl = re.sub(r"\s+", " ", k).strip().lower()
+        v = v.strip()
+        if kl in ("key id", "key_id"):
+            out["key_id"] = v
+        elif kl in ("key name", "key_name"):
+            out["key_name"] = v
+        elif kl in ("secret key", "secret_key"):
+            out["secret_key"] = v
+    return out
+
+
+def list_garage_buckets_live() -> list[dict]:
+    r = garage_run(["bucket", "list"], check=False)
+    if r.returncode != 0:
+        return []
+    return parse_garage_bucket_list(r.stdout or "")
+
+
+def list_garage_keys_live() -> list[dict]:
+    r = garage_run(["key", "list"], check=False)
+    if r.returncode != 0:
+        return []
+    return parse_garage_key_list(r.stdout or "")
+
+
+def cache_garage_inventory(state: dict) -> dict:
+    """Root can read /etc/garage.toml; the panel user often cannot (0640)."""
+    if unit_active(GARAGE_UNIT) == "active" and os.access(str(GARAGE_CONF), os.R_OK):
+        state["garage_buckets"] = list_garage_buckets_live()
+        state["garage_keys"] = list_garage_keys_live()
+    return state
+
+
+def list_garage_buckets(state: dict | None = None) -> list[dict]:
+    state = state if state is not None else load_state()
+    cached = state.get("garage_buckets") or []
+    if unit_active(GARAGE_UNIT) != "active":
+        return cached
+    if not os.access(str(GARAGE_CONF), os.R_OK):
+        return cached
+    live = list_garage_buckets_live()
+    return live if live or not cached else cached
+
+
+def list_garage_keys(state: dict | None = None) -> list[dict]:
+    state = state if state is not None else load_state()
+    cached = state.get("garage_keys") or []
+    if unit_active(GARAGE_UNIT) != "active":
+        return cached
+    if not os.access(str(GARAGE_CONF), os.R_OK):
+        return cached
+    live = list_garage_keys_live()
+    return live if live or not cached else cached
+
+
+def set_garage(on: bool, state: dict) -> None:
+    if not on:
+        run(["systemctl", "disable", "--now", GARAGE_UNIT], check=False)
+        return
+    ensure_garage_installed()
+    ensure_garage_user()
+    ensure_garage_dirs()
+    write_garage_config(state)
+    r = run(["systemctl", "enable", "--now", GARAGE_UNIT], check=False, timeout=60)
+    if r.returncode != 0 and unit_active(GARAGE_UNIT) != "active":
+        err = (r.stderr or r.stdout or "").strip() or unit_active(GARAGE_UNIT)
+        die("could not start garage.service: " + err)
+    wait_garage()
+    init_garage_layout()
+    cache_garage_inventory(state)
+    save_state(state)
+
+
+def valid_bucket_name(name: str) -> bool:
+    return bool(re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]", name))
+
+
+def valid_key_name(name: str) -> bool:
+    return bool(re.fullmatch(r"[a-zA-Z0-9._-]{1,64}", name))
+
+
 def cmd_status(_args: list[str]) -> None:
     live = live_ipv4()
     state = load_state()
@@ -306,8 +700,10 @@ def cmd_status(_args: list[str]) -> None:
     mode = detect_mode(state)
     dhcp_on = state.get("dhcp_enabled", True)
     dns_on = state.get("dns_enabled", True)
+    garage_on = bool(state.get("garage_enabled", False))
     samba = unit_active("samba.service")
     smb = unit_active("smb.service")
+    endpoint = s3_endpoint_host(state)
     out = {
         "hostname": socket.gethostname(),
         "mode": mode,
@@ -316,10 +712,18 @@ def cmd_status(_args: list[str]) -> None:
         "winbind": unit_active("winbind.service"),
         "kea": unit_active("kea-dhcp4.service"),
         "wsdd": unit_active("wsdd.service"),
+        "garage": unit_active(GARAGE_UNIT),
         "installed": is_dc() if mode == "host-ad" else SMB_CONF.is_file(),
         "is_dc": is_dc(),
         "dhcp_enabled": bool(dhcp_on),
         "dns_enabled": bool(dns_on),
+        "garage_enabled": garage_on,
+        "s3_endpoint": endpoint,
+        "s3_region": "garage",
+        "s3_path_style": True,
+        "s3_example": f"aws --endpoint-url http://{endpoint} s3 ls",
+        "buckets": list_garage_buckets(state) if garage_on else [],
+        "garage_keys": list_garage_keys(state) if garage_on else [],
         "realm": realm,
         "ip": primary.get("ip") or live["ip"],
         "prefix": str(primary.get("prefix") or live["prefix"]),
@@ -333,7 +737,8 @@ def cmd_status(_args: list[str]) -> None:
         "shares": parse_shares() or state.get("shares") or [],
         "kea_pools": parse_kea_pools(),
         "users": list_users(mode),
-        "packages": package_catalog(mode, bool(dhcp_on)),
+        "packages": package_catalog(mode, bool(dhcp_on), garage_on),
+        "version": HELPER_VERSION,
     }
     print(json.dumps(out))
 
@@ -801,7 +1206,7 @@ def parse_service_args(args: list[str]) -> dict:
                 pass
             i += 1
             continue
-        if a in ("--dhcp", "--dns", "dhcp", "dns"):
+        if a in ("--dhcp", "--dns", "--garage", "dhcp", "dns", "garage"):
             key = a.lstrip("-")
             val = args[i + 1] if i + 1 < len(args) else "on"
             spec[key] = flag_on(val)
@@ -813,7 +1218,7 @@ def parse_service_args(args: list[str]) -> dict:
             i += 1
             continue
         i += 1
-    for k in ("dhcp", "dns"):
+    for k in ("dhcp", "dns", "garage"):
         if k in spec:
             spec[k] = flag_on(spec[k])
     return spec
@@ -822,27 +1227,23 @@ def parse_service_args(args: list[str]) -> dict:
 def cmd_set_services(args: list[str]) -> None:
     need_root()
     if not args:
-        die("usage: set-services dhcp=on|off [dns=on|off]")
+        die("usage: set-services dhcp=on|off [dns=on|off] [garage=on|off]")
     spec = parse_service_args(args)
     payload = {
         "version": HELPER_VERSION,
         "argv": args,
         "spec": spec,
     }
-    logdir = Path("/etc/omarchy-ad")
-    logdir.mkdir(parents=True, exist_ok=True)
-    blob = json.dumps(payload, indent=2) + "\n"
-    (logdir / "set-services.log").write_text(blob, encoding="utf-8")
-    tmp = Path("/tmp/omarchy-ad-last-apply.json")
-    tmp.write_text(blob, encoding="utf-8")
-    os.chmod(tmp, 0o644)
+    log_last_apply(payload)
     if not spec:
-        die("no dhcp/dns flag in: " + " ".join(args))
+        die("no dhcp/dns/garage flag in: " + " ".join(args))
     state = load_state()
     if "dhcp" in spec:
         state["dhcp_enabled"] = bool(spec["dhcp"])
     if "dns" in spec:
         state["dns_enabled"] = bool(spec["dns"])
+    if "garage" in spec:
+        state["garage_enabled"] = bool(spec["garage"])
     save_state(state)
     if "dhcp" in spec:
         if state["dhcp_enabled"]:
@@ -853,12 +1254,24 @@ def cmd_set_services(args: list[str]) -> None:
                 set_kea(True)
         else:
             set_kea(False)
+    if "garage" in spec:
+        set_garage(bool(state["garage_enabled"]), state)
+    parts = []
+    if "dhcp" in spec or "dns" in spec:
+        parts.append("DHCP is " + ("ON" if state.get("dhcp_enabled") else "OFF"))
+        parts.append("DNS is " + ("ON" if state.get("dns_enabled") else "OFF"))
+    if "garage" in spec:
+        parts.append("Garage is " + ("ON" if state.get("garage_enabled") else "OFF"))
     out = {
         "ok": True,
         "version": HELPER_VERSION,
         "dhcp_enabled": bool(state.get("dhcp_enabled")),
         "dns_enabled": bool(state.get("dns_enabled")),
+        "garage_enabled": bool(state.get("garage_enabled", False)),
         "kea": unit_active("kea-dhcp4.service"),
+        "garage": unit_active(GARAGE_UNIT),
+        "s3_endpoint": s3_endpoint_host(state),
+        "message": "  ·  ".join(parts) if parts else "Saved",
     }
     print(json.dumps(out), flush=True)
 
@@ -961,6 +1374,111 @@ def cmd_user_del(args: list[str]) -> None:
     print(json.dumps({"ok": True, "deleted": name}))
 
 
+def cmd_garage_bucket_create(args: list[str]) -> None:
+    need_root()
+    spec = parse_kv(args)
+    name = (spec.get("name") or (args[0] if args and "=" not in args[0] else "")).strip()
+    if not name or not valid_bucket_name(name):
+        die("usage: garage-bucket-create name=BUCKET  (3–63 chars, lowercase, digits, . -)")
+    if not load_state().get("garage_enabled"):
+        die("Garage is off")
+    r = garage_run(["bucket", "create", name], check=False)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout or "bucket create failed").strip())
+    state = load_state()
+    cache_garage_inventory(state)
+    if not any((b.get("name") == name) for b in (state.get("garage_buckets") or [])):
+        state.setdefault("garage_buckets", []).append({"name": name, "id": ""})
+    save_state(state)
+    log_last_apply({"cmd": "garage-bucket-create", "name": name, "ok": True})
+    print(json.dumps({"ok": True, "name": name, "message": "Created bucket " + name}))
+
+
+def cmd_garage_bucket_delete(args: list[str]) -> None:
+    need_root()
+    spec = parse_kv(args)
+    name = (spec.get("name") or (args[0] if args and "=" not in args[0] else "")).strip()
+    if not name or not valid_bucket_name(name):
+        die("usage: garage-bucket-delete name=BUCKET")
+    if not load_state().get("garage_enabled"):
+        die("Garage is off")
+    r = garage_run(["bucket", "delete", "--yes", name], check=False)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout or "bucket delete failed").strip())
+    state = load_state()
+    cache_garage_inventory(state)
+    state["garage_buckets"] = [b for b in (state.get("garage_buckets") or []) if b.get("name") != name]
+    save_state(state)
+    log_last_apply({"cmd": "garage-bucket-delete", "name": name, "ok": True})
+    print(json.dumps({"ok": True, "deleted": name, "message": "Deleted bucket " + name}))
+
+
+def cmd_garage_key_create(args: list[str]) -> None:
+    need_root()
+    spec = parse_kv(args)
+    name = (spec.get("name") or (args[0] if args and "=" not in args[0] else "")).strip()
+    if not name or not valid_key_name(name):
+        die("usage: garage-key-create name=KEY")
+    if not load_state().get("garage_enabled"):
+        die("Garage is off")
+    r = garage_run(["key", "create", name], check=False)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout or "key create failed").strip())
+    parsed = parse_key_create(r.stdout or "")
+    if not parsed.get("secret_key"):
+        parsed = parse_key_create((r.stdout or "") + "\n" + (r.stderr or ""))
+    state = load_state()
+    cache_garage_inventory(state)
+    kid = parsed.get("key_id") or ""
+    kn = parsed.get("key_name") or name
+    keys = [k for k in (state.get("garage_keys") or []) if k.get("id") != kid and k.get("name") != kn]
+    keys.append({"id": kid, "name": kn})
+    state["garage_keys"] = keys
+    save_state(state)
+    log_last_apply({
+        "cmd": "garage-key-create",
+        "name": name,
+        "key_id": parsed.get("key_id") or "",
+        "ok": True,
+    })
+    print(json.dumps({
+        "ok": True,
+        "key_name": parsed.get("key_name") or name,
+        "key_id": parsed.get("key_id") or "",
+        "secret_key": parsed.get("secret_key") or "",
+        "message": "Created key " + name + ". Secret is shown once below.",
+    }))
+
+
+def cmd_garage_bucket_allow(args: list[str]) -> None:
+    need_root()
+    spec = parse_kv(args)
+    bucket = (spec.get("bucket") or spec.get("name") or "").strip()
+    key = (spec.get("key") or "").strip()
+    if not bucket or not key:
+        die("usage: garage-bucket-allow bucket=BUCKET key=KEY")
+    if not load_state().get("garage_enabled"):
+        die("Garage is off")
+    r = garage_run(
+        ["bucket", "allow", "--read", "--write", "--key", key, bucket],
+        check=False,
+    )
+    if r.returncode != 0:
+        die((r.stderr or r.stdout or "bucket allow failed").strip())
+    log_last_apply({
+        "cmd": "garage-bucket-allow",
+        "bucket": bucket,
+        "key": key,
+        "ok": True,
+    })
+    print(json.dumps({
+        "ok": True,
+        "bucket": bucket,
+        "key": key,
+        "message": "Allowed " + key + " read/write on " + bucket,
+    }))
+
+
 COMMANDS = {
     "status": cmd_status,
     "apply-network": cmd_apply_network,
@@ -976,6 +1494,10 @@ COMMANDS = {
     "user-add": cmd_user_add,
     "user-del": cmd_user_del,
     "packages-install": cmd_packages_install,
+    "garage-bucket-create": cmd_garage_bucket_create,
+    "garage-bucket-delete": cmd_garage_bucket_delete,
+    "garage-key-create": cmd_garage_key_create,
+    "garage-bucket-allow": cmd_garage_bucket_allow,
 }
 
 
