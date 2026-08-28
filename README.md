@@ -18,7 +18,9 @@ Pick one directory mode:
 
 DHCP and DNS are separate switches. You can host files with neither, run DHCP without being the office DNS, or (on Host AD) keep Samba’s AD DNS while DHCP clients get a forwarder instead of this box.
 
-Untagged LAN, tagged VLANs, and shares work in every mode. The DNS tab (manual A records) is for Host AD with DNS on. The Users tab is for Host AD and local users. Join AD does not invent users; they already live on the domain.
+S3 is a fourth switch: Garage on this same box, independent of Samba shares.
+
+Untagged LAN, tagged VLANs, and shares work in every mode. The DNS tab (manual A records) is for Host AD with DNS on. The Users tab is for Host AD and local users. Join AD does not invent users; they already live on the domain. The Buckets tab is S3 via Garage.
 
 ## Install
 
@@ -63,6 +65,15 @@ Edit realm, hostname, and addresses at the top of that script first. Join AD and
 - **DNS on** (Host AD) uses Samba DNS and, when DHCP is on, hands out this box as nameserver. Reverse zones are created per subnet.
 - **DNS off** does not stop the DC. AD SRV records still live in Samba. DHCP clients get the forwarder you set instead of this box.
 
+## S3 (Garage)
+
+[Garage](https://garagehq.deuxfleurs.fr/) is the S3-compatible object store on this box (Arch extra package `garage`). MinIO OSS was archived; this plugin uses Garage instead. One node, replication factor 1. It does not change Samba shares, Kea, or DNS.
+
+- **Garage on** writes `/etc/garage.toml` if needed (generates rpc/admin secrets), starts `garage.service`, and applies a single-node layout. Later toggles are idempotent. Survives reboot (`systemctl enable --now`).
+- **Garage off** stops and disables Garage only.
+- Endpoint is this box’s IP on port **3900**, path-style, region `garage`. Example: `aws --endpoint-url http://IP:3900 s3 ls`.
+- The Buckets tab lists buckets, creates/deletes them, creates an access key (secret shown once), and allows a key read/write on a bucket. Data lives under `/var/lib/garage`.
+
 ## VLANs
 
 The switch port must trunk the tags you add. Each tag gets a parent NIC (`eth0.10`), this box’s IP on that subnet, its own DHCP pool (if DHCP is on), and a reverse zone (if DNS is on). AD stays one realm. Hosts on VLAN 10 still resolve `office.lan`; they just use the DC address on that VLAN.
@@ -73,7 +84,7 @@ Name, path, unix mode, optional `valid users`, read-only switch. Reloads `smb.co
 
 ## Packages
 
-The Packages tab lists what the current mode needs (Samba, Kea, wsdd, and so on). If something required is missing, opening the panel jumps there and offers **Install missing**. That uses `omarchy-pkg-add` when present, otherwise `pacman -S --needed`, via polkit.
+The Packages tab lists what the current mode needs (Samba, Kea, wsdd, Garage when S3 is on, and so on). If something required is missing, opening the panel jumps there and offers **Install missing**. That uses `omarchy-pkg-add` when present, otherwise `pacman -S --needed`, via polkit.
 
 ## Privileges
 
@@ -86,7 +97,7 @@ State: `/etc/omarchy-ad/state.json`.
 ```
 manifest.json      plugin id office.ad
 BarWidget.qml      bar button
-Panel.qml          Mode, Network, VLANs, DNS, Shares, Users
+Panel.qml          Mode, Network, VLANs, DNS, Shares, Buckets, Users
 bin/omarchy-adctl  status + apply (pkexec)
 bin/omarchy-ad-dc-setup.sh   Host AD first provision
 ```

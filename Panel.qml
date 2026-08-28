@@ -26,9 +26,15 @@ Panel {
   property string dirMode: "host-ad"
   property bool dhcpEnabled: true
   property bool dnsEnabled: true
-  readonly property string pluginVersion: "1.2.4"
+  property bool garageEnabled: false
+  readonly property string pluginVersion: "1.3.0"
   property int missingPackages: 0
   property bool missingPrompted: false
+  property string s3Endpoint: ""
+  property string s3Example: ""
+  property string lastKeyId: ""
+  property string lastKeyName: ""
+  property string lastKeySecret: ""
 
   readonly property var tabs: {
     var list = [
@@ -39,6 +45,7 @@ Panel {
     if (dirMode === "host-ad" && dnsEnabled)
       list.push({ id: "dns", label: "DNS" })
     list.push({ id: "shares", label: "Shares" })
+    list.push({ id: "buckets", label: "Buckets" })
     if (dirMode === "host-ad" || dirMode === "local")
       list.push({ id: "users", label: "Users" })
     list.push({ id: "packages", label: "Packages" })
@@ -103,6 +110,10 @@ Panel {
       dhcpEnabled = d.dhcp_enabled
     if (typeof d.dns_enabled === "boolean")
       dnsEnabled = d.dns_enabled
+    if (typeof d.garage_enabled === "boolean")
+      garageEnabled = d.garage_enabled
+    s3Endpoint = d.s3_endpoint || ""
+    s3Example = d.s3_example || ""
     netIp.text = d.ip || ""
     netPrefix.text = d.prefix || "24"
     netGw.text = d.gateway || ""
@@ -157,6 +168,22 @@ Panel {
         kind: users[u].kind || ""
       })
     }
+    bucketModel.clear()
+    var buckets = d.buckets || []
+    for (var b = 0; b < buckets.length; b++) {
+      bucketModel.append({
+        name: buckets[b].name || "",
+        id: buckets[b].id || ""
+      })
+    }
+    keyModel.clear()
+    var keys = d.garage_keys || []
+    for (var k = 0; k < keys.length; k++) {
+      keyModel.append({
+        name: keys[k].name || "",
+        id: keys[k].id || ""
+      })
+    }
     pkgModel.clear()
     var pkgs = d.packages || []
     var miss = 0
@@ -195,10 +222,21 @@ Panel {
           dhcpEnabled = r.dhcp_enabled
         if (typeof r.dns_enabled === "boolean")
           dnsEnabled = r.dns_enabled
-        statusLine = "DHCP is " + (dhcpEnabled ? "ON" : "OFF")
-          + "  ·  DNS is " + (dnsEnabled ? "ON" : "OFF")
+        if (typeof r.garage_enabled === "boolean")
+          garageEnabled = r.garage_enabled
+        if (r.s3_endpoint)
+          s3Endpoint = r.s3_endpoint
+        if (r.secret_key) {
+          lastKeyId = r.key_id || ""
+          lastKeyName = r.key_name || ""
+          lastKeySecret = r.secret_key
+        }
+        if (r.message)
+          statusLine = r.message
+        else
+          statusLine = "Saved"
       } catch (e) {
-        statusLine = "Saved. DHCP is " + (dhcpEnabled ? "ON" : "OFF")
+        statusLine = "Saved"
       }
     } else {
       statusError = true
@@ -272,8 +310,32 @@ Panel {
       dhcpEnabled = on
     else if (name === "dns")
       dnsEnabled = on
-    statusLine = (name === "dhcp" ? "DHCP" : "DNS") + " → " + (on ? "on" : "off")
+    else if (name === "garage")
+      garageEnabled = on
+    var label = name === "dhcp" ? "DHCP" : (name === "dns" ? "DNS" : "Garage")
+    statusLine = label + " → " + (on ? "on" : "off")
     runPkexec([ctlPath, "set-services", name + "=" + (on ? "on" : "off")])
+  }
+
+  function addBucket() {
+    runPkexec([ctlPath, "garage-bucket-create", "name=" + bucketName.text.trim()])
+  }
+
+  function deleteBucket(name) {
+    runPkexec([ctlPath, "garage-bucket-delete", "name=" + name])
+  }
+
+  function addGarageKey() {
+    lastKeySecret = ""
+    runPkexec([ctlPath, "garage-key-create", "name=" + keyName.text.trim()])
+  }
+
+  function allowBucketKey() {
+    runPkexec([
+      ctlPath, "garage-bucket-allow",
+      "bucket=" + allowBucket.text.trim(),
+      "key=" + allowKey.text.trim()
+    ])
   }
 
   function joinAd() {
@@ -303,6 +365,7 @@ Panel {
 
   onOpenedChanged: if (opened) {
     statusLine = ""
+    lastKeySecret = ""
     missingPrompted = false
     refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -338,6 +401,8 @@ Panel {
   ListModel { id: shareModel }
   ListModel { id: userModel }
   ListModel { id: pkgModel }
+  ListModel { id: bucketModel }
+  ListModel { id: keyModel }
 
   Process {
     id: statusProc
@@ -422,6 +487,7 @@ Panel {
             text: "DHCP " + (root.dhcpEnabled ? "on" : "off")
               + "  ·  DNS " + (root.dnsEnabled ? "on" : "off")
               + "  ·  Kea " + (root.keaState || "off")
+              + "  ·  Garage " + (root.garageEnabled ? "on" : "off")
             color: root.dim
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
@@ -828,6 +894,205 @@ Panel {
               enabled: !root.applyBusy
               foreground: root.foreground
               onClicked: root.addShare()
+            }
+          }
+
+          Column {
+            visible: root.page === "buckets"
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "S3 (GARAGE)"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: "Single-node Garage on this box. Path-style S3 for rclone, restic, and aws cli. Independent of Samba shares."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Item {
+              width: parent.width
+              implicitHeight: Style.space(36)
+              Row {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                spacing: Style.space(10)
+                Text {
+                  text: "Garage is " + (root.garageEnabled ? "ON" : "OFF")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                ToggleSwitch {
+                  checked: root.garageEnabled
+                  busy: root.applyBusy
+                  interactive: false
+                  foreground: root.foreground
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+              }
+              MouseArea {
+                anchors.fill: parent
+                enabled: !root.applyBusy && !root.ingesting
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.applyService("garage", !root.garageEnabled)
+              }
+            }
+
+            Text {
+              width: parent.width
+              visible: root.s3Endpoint !== ""
+              text: "S3 endpoint  " + root.s3Endpoint + "  ·  path-style  ·  region garage"
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Text {
+              width: parent.width
+              visible: root.s3Example !== ""
+              text: root.s3Example
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WrapAnywhere
+            }
+
+            Column {
+              visible: root.garageEnabled
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSectionHeader {
+                text: "BUCKETS"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: bucketModel
+                Row {
+                  required property var modelData
+                  width: column.width
+                  spacing: Style.space(8)
+                  Text {
+                    width: parent.width - Style.space(80)
+                    text: modelData.name
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                  TextButton {
+                    label: "Del"
+                    foreground: root.urgent
+                    enabled: !root.applyBusy
+                    onClicked: root.deleteBucket(modelData.name)
+                  }
+                }
+              }
+
+              Text {
+                visible: bucketModel.count === 0
+                width: parent.width
+                text: "No buckets yet."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+
+              TextField { id: bucketName; width: parent.width; foreground: root.foreground; placeholderText: "Bucket name (office-backups)" }
+              TextButton {
+                label: "Create bucket"
+                enabled: !root.applyBusy
+                foreground: root.foreground
+                onClicked: root.addBucket()
+              }
+
+              PanelSectionHeader {
+                text: "ACCESS KEYS"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Repeater {
+                model: keyModel
+                Text {
+                  required property var modelData
+                  width: column.width
+                  text: (modelData.name !== "" ? modelData.name : modelData.id)
+                    + (modelData.name !== "" && modelData.id !== "" ? ("  ·  " + modelData.id) : "")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  wrapMode: Text.WordWrap
+                }
+              }
+
+              Text {
+                visible: keyModel.count === 0 && root.lastKeySecret === ""
+                width: parent.width
+                text: "No keys yet. Secret is shown once when you create one."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+                wrapMode: Text.WordWrap
+              }
+
+              TextField { id: keyName; width: parent.width; foreground: root.foreground; placeholderText: "Key name (restic)" }
+              TextButton {
+                label: "Create access key"
+                enabled: !root.applyBusy
+                foreground: root.foreground
+                onClicked: root.addGarageKey()
+              }
+
+              Text {
+                visible: root.lastKeySecret !== ""
+                width: parent.width
+                text: "Key " + (root.lastKeyName || root.lastKeyId)
+                  + (root.lastKeyId !== "" ? ("  ·  " + root.lastKeyId) : "")
+                  + "\nSecret  " + root.lastKeySecret
+                  + "\nCopy this now. It is not stored in status."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WrapAnywhere
+              }
+
+              PanelSectionHeader {
+                text: "ALLOW KEY ON BUCKET"
+                foreground: root.foreground
+                fontFamily: root.fontFamily
+              }
+
+              Text {
+                width: parent.width
+                text: "Read and write on one bucket. Key and bucket names as listed above."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+
+              TextField { id: allowBucket; width: parent.width; foreground: root.foreground; placeholderText: "Bucket" }
+              TextField { id: allowKey; width: parent.width; foreground: root.foreground; placeholderText: "Key name or ID" }
+              TextButton {
+                label: "Allow read/write"
+                enabled: !root.applyBusy
+                foreground: root.foreground
+                onClicked: root.allowBucketKey()
+              }
             }
           }
 
