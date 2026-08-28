@@ -25,6 +25,7 @@ Panel {
   property string dirMode: "host-ad"
   property bool dhcpEnabled: true
   property bool dnsEnabled: true
+  readonly property string pluginVersion: "1.2.3"
   property int missingPackages: 0
   property bool missingPrompted: false
 
@@ -385,7 +386,7 @@ Panel {
           PanelHero {
             width: parent.width
             title: "Omarchy NAS"
-            meta: root.modeLabel
+            meta: "v" + root.pluginVersion + "  ·  " + root.modeLabel
               + (root.hostname !== "" ? " · " + root.hostname : "")
               + (root.realm !== "" ? " · " + root.realm : "")
             foreground: root.foreground
@@ -499,7 +500,7 @@ Panel {
               Text {
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: "DHCP  ·  " + (root.dhcpEnabled ? "on" : "off")
+                text: root.dhcpEnabled ? "DHCP is ON" : "DHCP is OFF"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
@@ -526,7 +527,7 @@ Panel {
               Text {
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: "DNS  ·  " + (root.dnsEnabled ? "on" : "off")
+                text: root.dnsEnabled ? "DNS is ON" : "DNS is OFF"
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
