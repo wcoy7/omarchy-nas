@@ -235,13 +235,14 @@ Panel {
   }
 
   function applyService(name, on) {
-    if (ingesting)
+    if (ingesting || applyBusy)
       return
     if (name === "dhcp")
       dhcpEnabled = on
     else if (name === "dns")
       dnsEnabled = on
-    runPkexec([ctlPath, "set-services", name + "=" + (on ? "on" : "off")])
+    statusLine = (name === "dhcp" ? "DHCP" : "DNS") + " → " + (on ? "on" : "off")
+    runPkexec([ctlPath, "set-services", "--" + name, on ? "on" : "off"])
   }
 
   function joinAd() {
@@ -320,7 +321,10 @@ Panel {
   Process {
     id: applyProc
     running: false
-    stdout: StdioCollector { waitForEnd: true }
+    stdout: StdioCollector {
+      id: applyOut
+      waitForEnd: true
+    }
     stderr: StdioCollector {
       id: applyErr
       waitForEnd: true
@@ -328,7 +332,16 @@ Panel {
     onExited: function(code) {
       root.applyBusy = false
       if (code === 0) {
-        root.statusLine = "Applied"
+        try {
+          var r = JSON.parse(applyOut.text)
+          if (r.dhcp_enabled === true || r.dhcp_enabled === false)
+            root.dhcpEnabled = r.dhcp_enabled === true
+          if (r.dns_enabled === true || r.dns_enabled === false)
+            root.dnsEnabled = r.dns_enabled === true
+          root.statusLine = "DHCP " + (root.dhcpEnabled ? "on" : "off") + "  ·  DNS " + (root.dnsEnabled ? "on" : "off")
+        } catch (e) {
+          root.statusLine = "Applied"
+        }
       } else {
         var err = applyErr.text || "apply failed"
         root.statusLine = err.split("\n")[0]
@@ -480,47 +493,57 @@ Panel {
               wrapMode: Text.WordWrap
             }
 
-            Row {
-              spacing: Style.space(10)
+            Item {
+              width: parent.width
+              implicitHeight: Style.space(36)
               Text {
-                text: "DHCP"
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "DHCP  ·  " + (root.dhcpEnabled ? "on" : "off")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
-                anchors.verticalCenter: parent.verticalCenter
               }
               ToggleSwitch {
-                id: dhcpSwitch
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
                 checked: root.dhcpEnabled
                 busy: root.applyBusy
+                interactive: false
                 foreground: root.foreground
-                onToggled: {
-                  if (root.ingesting || root.applyBusy)
-                    return
-                  root.applyService("dhcp", !root.dhcpEnabled)
-                }
+              }
+              MouseArea {
+                anchors.fill: parent
+                enabled: !root.applyBusy && !root.ingesting
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.applyService("dhcp", !root.dhcpEnabled)
               }
             }
 
-            Row {
-              spacing: Style.space(10)
+            Item {
+              width: parent.width
+              implicitHeight: Style.space(36)
               Text {
-                text: "DNS"
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                text: "DNS  ·  " + (root.dnsEnabled ? "on" : "off")
                 color: root.foreground
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.body
-                anchors.verticalCenter: parent.verticalCenter
               }
               ToggleSwitch {
-                id: dnsSwitch
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
                 checked: root.dnsEnabled
                 busy: root.applyBusy
+                interactive: false
                 foreground: root.foreground
-                onToggled: {
-                  if (root.ingesting || root.applyBusy)
-                    return
-                  root.applyService("dns", !root.dnsEnabled)
-                }
+              }
+              MouseArea {
+                anchors.fill: parent
+                enabled: !root.applyBusy && !root.ingesting
+                cursorShape: Qt.PointingHandCursor
+                onClicked: root.applyService("dns", !root.dnsEnabled)
               }
             }
 

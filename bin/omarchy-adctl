@@ -767,35 +767,60 @@ def cmd_set_mode(args: list[str]) -> None:
     print(json.dumps({"ok": True, "mode": mode, "needs_setup": mode == "host-ad" and not is_dc()}))
 
 
-def flag_on(value: str) -> bool:
+def flag_on(value) -> bool:
+    if isinstance(value, bool):
+        return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def parse_service_args(args: list[str]) -> dict:
+    spec: dict = {}
+    i = 0
+    while i < len(args):
+        a = str(args[i])
+        if a.startswith("{") and "}" in a:
+            try:
+                spec.update(json.loads(a))
+            except json.JSONDecodeError:
+                pass
+            i += 1
+            continue
+        if a in ("--dhcp", "--dns", "dhcp", "dns"):
+            key = a.lstrip("-")
+            val = args[i + 1] if i + 1 < len(args) else "on"
+            spec[key] = flag_on(val)
+            i += 2
+            continue
+        if "=" in a:
+            k, v = a.split("=", 1)
+            spec[k.strip().lstrip("-")] = flag_on(v)
+            i += 1
+            continue
+        i += 1
+    for k in ("dhcp", "dns"):
+        if k in spec:
+            spec[k] = flag_on(spec[k])
+    return spec
 
 
 def cmd_set_services(args: list[str]) -> None:
     need_root()
     if not args:
-        die("usage: set-services dhcp=on|off [dns=on|off]")
-    spec: dict = {}
-    raw = args[0]
-    if raw.startswith("{"):
-        spec = json.loads(raw)
-        if "dhcp" in spec:
-            spec["dhcp"] = flag_on(spec["dhcp"]) if not isinstance(spec["dhcp"], bool) else spec["dhcp"]
-        if "dns" in spec:
-            spec["dns"] = flag_on(spec["dns"]) if not isinstance(spec["dns"], bool) else spec["dns"]
-    else:
-        for a in args:
-            if "=" not in a:
-                continue
-            k, v = a.split("=", 1)
-            spec[k.strip()] = flag_on(v)
+        die("usage: set-services --dhcp on|off [--dns on|off]")
+    spec = parse_service_args(args)
+    log = Path("/etc/omarchy-ad")
+    log.mkdir(parents=True, exist_ok=True)
+    (log / "set-services.log").write_text(
+        json.dumps({"argv": args, "spec": spec}, indent=2) + "\n", encoding="utf-8"
+    )
+    if not spec:
+        die("no dhcp/dns flag in: " + " ".join(args))
     state = load_state()
     if "dhcp" in spec:
-        state["dhcp_enabled"] = bool(spec["dhcp"])
+        state["dhcp_enabled"] = spec["dhcp"]
     if "dns" in spec:
-        state["dns_enabled"] = bool(spec["dns"])
+        state["dns_enabled"] = spec["dns"]
     save_state(state)
-    # Only touch Kea when DHCP itself changed. DNS is a flag for the next pool rebuild.
     if "dhcp" in spec:
         if state.get("dhcp_enabled"):
             if (state.get("primary") or {}).get("ip"):
@@ -804,11 +829,12 @@ def cmd_set_services(args: list[str]) -> None:
                 run(["systemctl", "enable", "--now", "kea-dhcp4.service"], check=False)
         else:
             run(["systemctl", "disable", "--now", "kea-dhcp4.service"], check=False)
-    print(json.dumps({
+    out = {
         "ok": True,
         "dhcp_enabled": bool(state.get("dhcp_enabled", True)),
         "dns_enabled": bool(state.get("dns_enabled", True)),
-    }))
+    }
+    print(json.dumps(out))
 
 
 def cmd_join_ad(args: list[str]) -> None:
