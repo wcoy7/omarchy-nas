@@ -98,8 +98,6 @@ Panel {
     dirMode = d.mode || "host-ad"
     dhcpEnabled = d.dhcp_enabled !== false
     dnsEnabled = d.dns_enabled !== false
-    dhcpSwitch.checked = dhcpEnabled
-    dnsSwitch.checked = dnsEnabled
     netIp.text = d.ip || ""
     netPrefix.text = d.prefix || "24"
     netGw.text = d.gateway || ""
@@ -236,13 +234,14 @@ Panel {
     runPkexec([ctlPath, "set-mode", mode])
   }
 
-  function applyServices() {
+  function applyService(name, on) {
     if (ingesting)
       return
-    runPkexec([ctlPath, "set-services", JSON.stringify({
-      dhcp: dhcpSwitch.checked,
-      dns: dnsSwitch.checked
-    })])
+    if (name === "dhcp")
+      dhcpEnabled = on
+    else if (name === "dns")
+      dnsEnabled = on
+    runPkexec([ctlPath, "set-services", name + "=" + (on ? "on" : "off")])
   }
 
   function joinAd() {
@@ -330,11 +329,11 @@ Panel {
       root.applyBusy = false
       if (code === 0) {
         root.statusLine = "Applied"
-        root.refresh()
       } else {
         var err = applyErr.text || "apply failed"
         root.statusLine = err.split("\n")[0]
       }
+      root.refresh()
     }
   }
 
@@ -492,9 +491,14 @@ Panel {
               }
               ToggleSwitch {
                 id: dhcpSwitch
-                checked: true
+                checked: root.dhcpEnabled
+                busy: root.applyBusy
                 foreground: root.foreground
-                onToggled: root.applyServices()
+                onToggled: {
+                  if (root.ingesting || root.applyBusy)
+                    return
+                  root.applyService("dhcp", !root.dhcpEnabled)
+                }
               }
             }
 
@@ -509,9 +513,14 @@ Panel {
               }
               ToggleSwitch {
                 id: dnsSwitch
-                checked: true
+                checked: root.dnsEnabled
+                busy: root.applyBusy
                 foreground: root.foreground
-                onToggled: root.applyServices()
+                onToggled: {
+                  if (root.ingesting || root.applyBusy)
+                    return
+                  root.applyService("dns", !root.dnsEnabled)
+                }
               }
             }
 

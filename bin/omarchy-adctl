@@ -767,24 +767,43 @@ def cmd_set_mode(args: list[str]) -> None:
     print(json.dumps({"ok": True, "mode": mode, "needs_setup": mode == "host-ad" and not is_dc()}))
 
 
+def flag_on(value: str) -> bool:
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 def cmd_set_services(args: list[str]) -> None:
     need_root()
     if not args:
-        die("usage: set-services JSON")
-    spec = json.loads(args[0])
+        die("usage: set-services dhcp=on|off [dns=on|off]")
+    spec: dict = {}
+    raw = args[0]
+    if raw.startswith("{"):
+        spec = json.loads(raw)
+        if "dhcp" in spec:
+            spec["dhcp"] = flag_on(spec["dhcp"]) if not isinstance(spec["dhcp"], bool) else spec["dhcp"]
+        if "dns" in spec:
+            spec["dns"] = flag_on(spec["dns"]) if not isinstance(spec["dns"], bool) else spec["dns"]
+    else:
+        for a in args:
+            if "=" not in a:
+                continue
+            k, v = a.split("=", 1)
+            spec[k.strip()] = flag_on(v)
     state = load_state()
     if "dhcp" in spec:
         state["dhcp_enabled"] = bool(spec["dhcp"])
     if "dns" in spec:
         state["dns_enabled"] = bool(spec["dns"])
     save_state(state)
-    if state.get("dhcp_enabled", True):
-        if (state.get("primary") or {}).get("ip"):
-            rebuild_kea(state)
+    # Only touch Kea when DHCP itself changed. DNS is a flag for the next pool rebuild.
+    if "dhcp" in spec:
+        if state.get("dhcp_enabled"):
+            if (state.get("primary") or {}).get("ip"):
+                rebuild_kea(state)
+            else:
+                run(["systemctl", "enable", "--now", "kea-dhcp4.service"], check=False)
         else:
-            run(["systemctl", "enable", "--now", "kea-dhcp4.service"], check=False)
-    else:
-        run(["systemctl", "disable", "--now", "kea-dhcp4.service"], check=False)
+            run(["systemctl", "disable", "--now", "kea-dhcp4.service"], check=False)
     print(json.dumps({
         "ok": True,
         "dhcp_enabled": bool(state.get("dhcp_enabled", True)),
