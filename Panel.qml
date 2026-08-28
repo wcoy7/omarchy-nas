@@ -1248,7 +1248,7 @@ Panel {
 
             Text {
               width: parent.width
-              text: "This plugin is MIT. Packages below are what office.ad can install. Turning on DHCP, Garage, or Host AD may pull some of them in; they stay listed here either way. Identifiers only — not full GPL/AGPL/MPL text."
+              text: "Turning on DHCP, Garage, or Host AD may install extra packages; licenses stay listed here. Identifiers only, not full license text."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
