@@ -84,7 +84,7 @@ Name, path, unix mode, optional `valid users`, read-only switch. Reloads `smb.co
 
 ## Packages
 
-The Packages tab lists what the current mode needs (Samba, Kea, wsdd, Garage when S3 is on, and so on). If something required is missing, opening the panel jumps there and offers **Install missing**. That uses `omarchy-pkg-add` when present, otherwise `pacman -S --needed`, via polkit.
+The Packages tab lists what the current mode needs (Samba, Kea, wsdd, Garage when S3 is on, and so on). If something required is missing, opening the panel jumps there and offers **Install missing**. That uses `omarchy-pkg-add` when present, otherwise `pacman -S --needed`, via polkit. The Licenses tab lists this plugin’s MIT license plus the licenses of every package it can install.
 
 ## Privileges
 
@@ -97,7 +97,7 @@ State: `/etc/omarchy-ad/state.json`.
 ```
 manifest.json      plugin id office.ad
 BarWidget.qml      bar button
-Panel.qml          Mode, Network, VLANs, DNS, Shares, Buckets, Users
+Panel.qml          Mode, Network, VLANs, DNS, Shares, Buckets, Users, Packages, Licenses
 bin/omarchy-adctl  status + apply (pkexec)
 bin/omarchy-ad-dc-setup.sh   Host AD first provision
 ```

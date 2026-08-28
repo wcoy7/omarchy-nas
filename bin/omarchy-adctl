@@ -34,7 +34,7 @@ def need_root() -> None:
         die("need root (use pkexec)")
 
 
-HELPER_VERSION = "1.3.0"
+HELPER_VERSION = "1.3.1"
 KEA_UNITS = ("kea-dhcp4.service", "kea-dhcp4-server.service")
 # Arch extra ships garage 2.3: /usr/bin/garage, garage.service (User=garage),
 # /etc/garage.toml. CLI verified against v2.3.0 structs.rs: `key create`,
@@ -194,8 +194,58 @@ def pkg_installed(name: str) -> bool:
     return r.returncode == 0
 
 
-def package_catalog(mode: str, dhcp_on: bool, garage_on: bool = False) -> list[dict]:
-    rows = [
+# Arch extra/core License fields (pacman -Si / packages.archlinux.org), Aug 2026.
+# Used when pacman is missing so the Licenses tab still has identifiers.
+PACKAGE_LICENSES = {
+    "samba": "GPL-3.0-or-later",
+    "wsdd": "MIT",
+    "networkmanager": "GPL-2.0-or-later, LGPL-2.1-or-later",
+    "krb5": "custom",
+    "chrony": "GPL-2.0-only",
+    "python-cryptography": "Apache-2.0 OR BSD-3-Clause",
+    "python-dnspython": "ISC",
+    "python-markdown": "BSD-3-Clause",
+    "kea": "MPL-2.0",
+    "kea-docs": "MPL-2.0",
+    "bind": "MPL2",
+    "restic": "BSD",
+    "garage": "AGPL-3.0-only",
+}
+
+
+def parse_pacman_licenses(text: str) -> str:
+    licenses: list[str] = []
+    in_license = False
+    for line in text.splitlines():
+        key = line.split(":", 1)[0].strip().lower() if ":" in line else ""
+        if key in ("license", "licenses"):
+            in_license = True
+            val = line.split(":", 1)[1].strip()
+            if val:
+                licenses.append(val)
+            continue
+        if in_license:
+            if line[:1] in (" ", "\t"):
+                val = line.split(":", 1)[-1].strip() if ":" in line else line.strip()
+                if val:
+                    licenses.append(val)
+            else:
+                break
+    return ", ".join(licenses)
+
+
+def pkg_license(name: str) -> str:
+    for args in (["pacman", "-Qi", name], ["pacman", "-Si", name]):
+        r = run(args, check=False)
+        if r.returncode == 0:
+            lic = parse_pacman_licenses(r.stdout or "")
+            if lic:
+                return lic
+    return PACKAGE_LICENSES.get(name, "unknown")
+
+
+def catalog_rows(mode: str, dhcp_on: bool, garage_on: bool = False) -> list[tuple]:
+    return [
         ("samba", True, "File shares and directory", True),
         ("wsdd", True, "Windows Network Neighborhood discovery", True),
         ("networkmanager", True, "Static IP and VLAN interfaces", True),
@@ -210,8 +260,11 @@ def package_catalog(mode: str, dhcp_on: bool, garage_on: bool = False) -> list[d
         ("restic", mode == "host-ad", "AD backups to B2", False),
         ("garage", garage_on, "S3-compatible object store (Deuxfleurs Garage)", True),
     ]
+
+
+def package_catalog(mode: str, dhcp_on: bool, garage_on: bool = False) -> list[dict]:
     out = []
-    for name, applies, why, required in rows:
+    for name, applies, why, required in catalog_rows(mode, dhcp_on, garage_on):
         if not applies:
             continue
         inst = pkg_installed(name)
@@ -223,6 +276,27 @@ def package_catalog(mode: str, dhcp_on: bool, garage_on: bool = False) -> list[d
             "missing": required and not inst,
         })
     return out
+
+
+def license_catalog(mode: str, dhcp_on: bool, garage_on: bool = False) -> list[dict]:
+    rows = [
+        {
+            "name": "Omarchy NAS",
+            "license": "MIT",
+            "why": "office.ad plugin",
+            "required": True,
+            "applies": True,
+        }
+    ]
+    for name, applies, why, required in catalog_rows(mode, dhcp_on, garage_on):
+        rows.append({
+            "name": name,
+            "license": pkg_license(name),
+            "why": why,
+            "required": required,
+            "applies": applies,
+        })
+    return rows
 
 
 def cmd_packages_install(_args: list[str]) -> None:
@@ -738,6 +812,7 @@ def cmd_status(_args: list[str]) -> None:
         "kea_pools": parse_kea_pools(),
         "users": list_users(mode),
         "packages": package_catalog(mode, bool(dhcp_on), garage_on),
+        "licenses": license_catalog(mode, bool(dhcp_on), garage_on),
         "version": HELPER_VERSION,
     }
     print(json.dumps(out))
