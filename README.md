@@ -71,6 +71,10 @@ The switch port must trunk the tags you add. Each tag gets a parent NIC (`eth0.1
 
 Name, path, unix mode, optional `valid users`, read-only switch. Reloads `smb.conf` in place.
 
+## Packages
+
+The Packages tab lists what the current mode needs (Samba, Kea, wsdd, and so on). If something required is missing, opening the panel jumps there and offers **Install missing**. That uses `omarchy-pkg-add` when present, otherwise `pacman -S --needed`, via polkit.
+
 ## Privileges
 
 Plugins run unsandboxed as your user inside `omarchy-shell`. The panel cannot sudo. Changes go through `pkexec bin/omarchy-adctl`. Status is unprivileged.

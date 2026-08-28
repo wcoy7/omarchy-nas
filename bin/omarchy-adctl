@@ -160,6 +160,62 @@ def parse_kea_pools() -> list[dict]:
     return rows
 
 
+
+def pkg_installed(name: str) -> bool:
+    r = run(["pacman", "-Q", "--quiet", name], check=False)
+    return r.returncode == 0
+
+
+def package_catalog(mode: str, dhcp_on: bool) -> list[dict]:
+    rows = [
+        ("samba", True, "File shares and directory", True),
+        ("wsdd", True, "Windows Network Neighborhood discovery", True),
+        ("networkmanager", True, "Static IP and VLAN interfaces", True),
+        ("krb5", mode in ("host-ad", "join-ad"), "Kerberos", True),
+        ("chrony", mode == "host-ad", "Time sync for AD", True),
+        ("python-cryptography", mode == "host-ad", "samba-tool", True),
+        ("python-dnspython", mode == "host-ad", "samba-tool DNS", True),
+        ("python-markdown", mode == "host-ad", "samba-tool docs", False),
+        ("kea", dhcp_on, "DHCP server", True),
+        ("kea-docs", dhcp_on, "Kea docs", False),
+        ("bind", mode == "host-ad", "host/dig for DNS checks", False),
+        ("restic", mode == "host-ad", "AD backups to B2", False),
+    ]
+    out = []
+    for name, applies, why, required in rows:
+        if not applies:
+            continue
+        inst = pkg_installed(name)
+        out.append({
+            "name": name,
+            "installed": inst,
+            "required": required,
+            "why": why,
+            "missing": required and not inst,
+        })
+    return out
+
+
+def cmd_packages_install(_args: list[str]) -> None:
+    need_root()
+    state = load_state()
+    mode = detect_mode(state)
+    catalog = package_catalog(mode, bool(state.get("dhcp_enabled", True)))
+    missing = [p["name"] for p in catalog if p["missing"]]
+    if not missing:
+        print(json.dumps({"ok": True, "installed": []}))
+        return
+    if shutil_which("omarchy-pkg-add"):
+        cmd = ["omarchy-pkg-add"] + missing
+    else:
+        cmd = ["pacman", "-S", "--noconfirm", "--needed"] + missing
+    r = run(cmd, check=False, timeout=600)
+    if r.returncode != 0:
+        die((r.stderr or r.stdout or "package install failed").strip())
+    print(json.dumps({"ok": True, "installed": missing}))
+
+
+
 SAM_LDB = Path("/var/lib/samba/private/sam.ldb")
 
 
@@ -261,6 +317,7 @@ def cmd_status(_args: list[str]) -> None:
         "shares": parse_shares() or state.get("shares") or [],
         "kea_pools": parse_kea_pools(),
         "users": list_users(mode),
+        "packages": package_catalog(mode, bool(dhcp_on)),
     }
     print(json.dumps(out))
 
@@ -847,6 +904,7 @@ COMMANDS = {
     "join-ad": cmd_join_ad,
     "user-add": cmd_user_add,
     "user-del": cmd_user_del,
+    "packages-install": cmd_packages_install,
 }
 
 

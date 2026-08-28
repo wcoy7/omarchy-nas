@@ -25,6 +25,8 @@ Panel {
   property string dirMode: "host-ad"
   property bool dhcpEnabled: true
   property bool dnsEnabled: true
+  property int missingPackages: 0
+  property bool missingPrompted: false
 
   readonly property var tabs: {
     var list = [
@@ -37,6 +39,7 @@ Panel {
     list.push({ id: "shares", label: "Shares" })
     if (dirMode === "host-ad" || dirMode === "local")
       list.push({ id: "users", label: "Users" })
+    list.push({ id: "packages", label: "Packages" })
     return list
   }
 
@@ -151,6 +154,28 @@ Panel {
         kind: users[u].kind || ""
       })
     }
+    pkgModel.clear()
+    var pkgs = d.packages || []
+    var miss = 0
+    for (var p = 0; p < pkgs.length; p++) {
+      pkgModel.append({
+        name: pkgs[p].name || "",
+        installed: pkgs[p].installed === true,
+        required: pkgs[p].required === true,
+        why: pkgs[p].why || "",
+        missing: pkgs[p].missing === true
+      })
+      if (pkgs[p].missing === true)
+        miss++
+    }
+    missingPackages = miss
+    if (!missingPrompted) {
+      missingPrompted = true
+      if (miss > 0) {
+        page = "packages"
+        statusLine = miss + (miss === 1 ? " required package is missing" : " required packages are missing")
+      }
+    }
     ingesting = false
   }
 
@@ -241,8 +266,13 @@ Panel {
     runPkexec([ctlPath, "user-del", name])
   }
 
+  function installMissing() {
+    runPkexec([ctlPath, "packages-install"])
+  }
+
   onOpenedChanged: if (opened) {
     statusLine = ""
+    missingPrompted = false
     refresh()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
@@ -276,6 +306,7 @@ Panel {
   ListModel { id: hostModel }
   ListModel { id: shareModel }
   ListModel { id: userModel }
+  ListModel { id: pkgModel }
 
   Process {
     id: statusProc
@@ -801,6 +832,75 @@ Panel {
               enabled: !root.applyBusy
               foreground: root.foreground
               onClicked: root.addUser()
+            }
+          }
+
+          Column {
+            visible: root.page === "packages"
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "PACKAGES"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: root.missingPackages > 0
+                ? (root.missingPackages + " required for this mode are not installed. Polkit will ask, then omarchy-pkg-add (or pacman) runs.")
+                : "Everything this mode needs is installed."
+              color: root.missingPackages > 0 ? root.urgent : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Repeater {
+              model: pkgModel
+              Row {
+                required property var modelData
+                width: column.width
+                spacing: Style.space(8)
+
+                Text {
+                  width: Style.space(18)
+                  text: modelData.installed ? "✓" : (modelData.required ? "!" : "·")
+                  color: modelData.installed ? root.foreground : (modelData.required ? root.urgent : root.dim)
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                Column {
+                  width: parent.width - Style.space(30)
+                  spacing: Style.space(1)
+                  Text {
+                    width: parent.width
+                    text: modelData.name + (modelData.required ? "" : "  (optional)")
+                    color: root.foreground
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.body
+                    elide: Text.ElideRight
+                  }
+                  Text {
+                    width: parent.width
+                    text: modelData.why + (modelData.installed ? "  ·  installed" : "  ·  not installed")
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                    wrapMode: Text.WordWrap
+                  }
+                }
+              }
+            }
+
+            TextButton {
+              visible: root.missingPackages > 0
+              label: root.applyBusy ? "Installing…" : "Install missing"
+              enabled: !root.applyBusy
+              foreground: root.foreground
+              onClicked: root.installMissing()
             }
           }
         }
