@@ -27,7 +27,7 @@ Panel {
   property bool dhcpEnabled: true
   property bool dnsEnabled: true
   property bool garageEnabled: false
-  readonly property string pluginVersion: "1.3.0"
+  readonly property string pluginVersion: "1.3.1"
   property int missingPackages: 0
   property bool missingPrompted: false
   property string s3Endpoint: ""
@@ -49,6 +49,7 @@ Panel {
     if (dirMode === "host-ad" || dirMode === "local")
       list.push({ id: "users", label: "Users" })
     list.push({ id: "packages", label: "Packages" })
+    list.push({ id: "licenses", label: "Licenses" })
     return list
   }
 
@@ -199,6 +200,17 @@ Panel {
         miss++
     }
     missingPackages = miss
+    licenseModel.clear()
+    var lics = d.licenses || []
+    for (var li = 0; li < lics.length; li++) {
+      licenseModel.append({
+        name: lics[li].name || "",
+        license: lics[li].license || "",
+        why: lics[li].why || "",
+        required: lics[li].required === true,
+        applies: lics[li].applies === true
+      })
+    }
     if (!missingPrompted) {
       missingPrompted = true
       if (miss > 0) {
@@ -401,6 +413,7 @@ Panel {
   ListModel { id: shareModel }
   ListModel { id: userModel }
   ListModel { id: pkgModel }
+  ListModel { id: licenseModel }
   ListModel { id: bucketModel }
   ListModel { id: keyModel }
 
@@ -1219,6 +1232,54 @@ Panel {
               enabled: !root.applyBusy
               foreground: root.foreground
               onClicked: root.installMissing()
+            }
+          }
+
+          Column {
+            visible: root.page === "licenses"
+            width: parent.width
+            spacing: Style.space(8)
+
+            PanelSectionHeader {
+              text: "LICENSES"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+            }
+
+            Text {
+              width: parent.width
+              text: "Turning on DHCP, Garage, or Host AD may install extra packages; licenses stay listed here. Identifiers only, not full license text."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              wrapMode: Text.WordWrap
+            }
+
+            Repeater {
+              model: licenseModel
+              Column {
+                required property var modelData
+                width: column.width
+                spacing: Style.space(1)
+
+                Text {
+                  width: parent.width
+                  text: modelData.name + "  ·  " + modelData.license
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  wrapMode: Text.WordWrap
+                }
+                Text {
+                  width: parent.width
+                  text: modelData.why
+                    + (modelData.applies ? "" : "  ·  not this mode")
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                  wrapMode: Text.WordWrap
+                }
+              }
             }
           }
         }
