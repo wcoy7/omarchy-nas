@@ -1238,6 +1238,7 @@ def cmd_set_services(args: list[str]) -> None:
     if not spec:
         die("no dhcp/dns/garage flag in: " + " ".join(args))
     state = load_state()
+    prev_garage = bool(state.get("garage_enabled", False))
     if "dhcp" in spec:
         state["dhcp_enabled"] = bool(spec["dhcp"])
     if "dns" in spec:
@@ -1255,7 +1256,12 @@ def cmd_set_services(args: list[str]) -> None:
         else:
             set_kea(False)
     if "garage" in spec:
-        set_garage(bool(state["garage_enabled"]), state)
+        try:
+            set_garage(bool(state["garage_enabled"]), state)
+        except SystemExit:
+            state["garage_enabled"] = prev_garage
+            save_state(state)
+            raise
     parts = []
     if "dhcp" in spec or "dns" in spec:
         parts.append("DHCP is " + ("ON" if state.get("dhcp_enabled") else "OFF"))
