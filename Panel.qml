@@ -15,6 +15,7 @@ Panel {
   property string page: "mode"
   property string statusLine: ""
   property bool applyBusy: false
+  property bool statusError: false
   property bool ingesting: false
   property bool installed: false
   property bool isDc: false
@@ -25,7 +26,7 @@ Panel {
   property string dirMode: "host-ad"
   property bool dhcpEnabled: true
   property bool dnsEnabled: true
-  readonly property string pluginVersion: "1.2.3"
+  readonly property string pluginVersion: "1.2.4"
   property int missingPackages: 0
   property bool missingPrompted: false
 
@@ -87,6 +88,7 @@ Panel {
       var d = JSON.parse(text)
     } catch (e) {
       statusLine = "Could not read status"
+      statusError = true
       return
     }
     ingesting = true
@@ -97,8 +99,10 @@ Panel {
     realm = d.realm || ""
     hostname = d.hostname || ""
     dirMode = d.mode || "host-ad"
-    dhcpEnabled = d.dhcp_enabled !== false
-    dnsEnabled = d.dns_enabled !== false
+    if (typeof d.dhcp_enabled === "boolean")
+      dhcpEnabled = d.dhcp_enabled
+    if (typeof d.dns_enabled === "boolean")
+      dnsEnabled = d.dns_enabled
     netIp.text = d.ip || ""
     netPrefix.text = d.prefix || "24"
     netGw.text = d.gateway || ""
@@ -172,14 +176,40 @@ Panel {
       missingPrompted = true
       if (miss > 0) {
         page = "packages"
+        statusError = true
         statusLine = miss + (miss === 1 ? " required package is missing" : " required packages are missing")
       }
     }
     ingesting = false
   }
 
+  function finishApply(code) {
+    applyBusy = false
+    var out = applyOut.text ? String(applyOut.text).trim() : ""
+    var err = applyErr.text ? String(applyErr.text).trim() : ""
+    if (code === 0) {
+      statusError = false
+      try {
+        var r = JSON.parse(out)
+        if (typeof r.dhcp_enabled === "boolean")
+          dhcpEnabled = r.dhcp_enabled
+        if (typeof r.dns_enabled === "boolean")
+          dnsEnabled = r.dns_enabled
+        statusLine = "DHCP is " + (dhcpEnabled ? "ON" : "OFF")
+          + "  ·  DNS is " + (dnsEnabled ? "ON" : "OFF")
+      } catch (e) {
+        statusLine = "Saved. DHCP is " + (dhcpEnabled ? "ON" : "OFF")
+      }
+    } else {
+      statusError = true
+      statusLine = (err || out || "apply failed").split("\n")[0]
+    }
+    refresh()
+  }
+
   function runPkexec(args) {
     applyBusy = true
+    statusError = false
     statusLine = "Waiting for polkit…"
     applyProc.running = false
     applyProc.command = ["pkexec"].concat(args)
@@ -243,7 +273,7 @@ Panel {
     else if (name === "dns")
       dnsEnabled = on
     statusLine = (name === "dhcp" ? "DHCP" : "DNS") + " → " + (on ? "on" : "off")
-    runPkexec([ctlPath, "set-services", "--" + name, on ? "on" : "off"])
+    runPkexec([ctlPath, "set-services", name + "=" + (on ? "on" : "off")])
   }
 
   function joinAd() {
@@ -331,23 +361,7 @@ Panel {
       waitForEnd: true
     }
     onExited: function(code) {
-      root.applyBusy = false
-      if (code === 0) {
-        try {
-          var r = JSON.parse(applyOut.text)
-          if (r.dhcp_enabled === true || r.dhcp_enabled === false)
-            root.dhcpEnabled = r.dhcp_enabled === true
-          if (r.dns_enabled === true || r.dns_enabled === false)
-            root.dnsEnabled = r.dns_enabled === true
-          root.statusLine = "DHCP " + (root.dhcpEnabled ? "on" : "off") + "  ·  DNS " + (root.dnsEnabled ? "on" : "off")
-        } catch (e) {
-          root.statusLine = "Applied"
-        }
-      } else {
-        var err = applyErr.text || "apply failed"
-        root.statusLine = err.split("\n")[0]
-      }
-      root.refresh()
+      Qt.callLater(function() { root.finishApply(code) })
     }
   }
 
@@ -397,7 +411,7 @@ Panel {
             width: parent.width
             visible: root.statusLine !== ""
             text: root.statusLine
-            color: root.applyBusy ? root.dim : root.urgent
+            color: root.applyBusy ? root.dim : (root.statusError ? root.urgent : root.dim)
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
             wrapMode: Text.WordWrap
@@ -497,21 +511,24 @@ Panel {
             Item {
               width: parent.width
               implicitHeight: Style.space(36)
-              Text {
+              Row {
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: root.dhcpEnabled ? "DHCP is ON" : "DHCP is OFF"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              ToggleSwitch {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                checked: root.dhcpEnabled
-                busy: root.applyBusy
-                interactive: false
-                foreground: root.foreground
+                spacing: Style.space(10)
+                Text {
+                  text: "DHCP is " + (root.dhcpEnabled ? "ON" : "OFF")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                ToggleSwitch {
+                  checked: root.dhcpEnabled
+                  busy: root.applyBusy
+                  interactive: false
+                  foreground: root.foreground
+                  anchors.verticalCenter: parent.verticalCenter
+                }
               }
               MouseArea {
                 anchors.fill: parent
@@ -524,21 +541,24 @@ Panel {
             Item {
               width: parent.width
               implicitHeight: Style.space(36)
-              Text {
+              Row {
                 anchors.left: parent.left
                 anchors.verticalCenter: parent.verticalCenter
-                text: root.dnsEnabled ? "DNS is ON" : "DNS is OFF"
-                color: root.foreground
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.body
-              }
-              ToggleSwitch {
-                anchors.right: parent.right
-                anchors.verticalCenter: parent.verticalCenter
-                checked: root.dnsEnabled
-                busy: root.applyBusy
-                interactive: false
-                foreground: root.foreground
+                spacing: Style.space(10)
+                Text {
+                  text: "DNS is " + (root.dnsEnabled ? "ON" : "OFF")
+                  color: root.foreground
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.body
+                  anchors.verticalCenter: parent.verticalCenter
+                }
+                ToggleSwitch {
+                  checked: root.dnsEnabled
+                  busy: root.applyBusy
+                  interactive: false
+                  foreground: root.foreground
+                  anchors.verticalCenter: parent.verticalCenter
+                }
               }
               MouseArea {
                 anchors.fill: parent

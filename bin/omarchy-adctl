@@ -26,6 +26,10 @@ def need_root() -> None:
         die("need root (use pkexec)")
 
 
+HELPER_VERSION = "1.2.4"
+KEA_UNITS = ("kea-dhcp4.service", "kea-dhcp4-server.service")
+
+
 def run(cmd: list[str], check: bool = True, timeout: int = 20) -> subprocess.CompletedProcess:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
@@ -33,10 +37,22 @@ def run(cmd: list[str], check: bool = True, timeout: int = 20) -> subprocess.Com
         if check:
             die(f"missing command: {cmd[0]}")
         return subprocess.CompletedProcess(cmd, 127, "", f"missing command: {cmd[0]}")
+    except subprocess.TimeoutExpired:
+        if check:
+            die(f"timeout: {' '.join(cmd)}")
+        return subprocess.CompletedProcess(cmd, 124, "", "timeout")
     if check and r.returncode != 0:
         err = (r.stderr or r.stdout or "").strip() or f"failed: {' '.join(cmd)}"
         die(err)
     return r
+
+
+def set_kea(on: bool) -> None:
+    for unit in KEA_UNITS:
+        if on:
+            run(["systemctl", "enable", "--now", unit], check=False)
+        else:
+            run(["systemctl", "disable", "--now", unit], check=False)
 
 
 def unit_active(name: str) -> str:
@@ -806,35 +822,45 @@ def parse_service_args(args: list[str]) -> dict:
 def cmd_set_services(args: list[str]) -> None:
     need_root()
     if not args:
-        die("usage: set-services --dhcp on|off [--dns on|off]")
+        die("usage: set-services dhcp=on|off [dns=on|off]")
     spec = parse_service_args(args)
-    log = Path("/etc/omarchy-ad")
-    log.mkdir(parents=True, exist_ok=True)
-    (log / "set-services.log").write_text(
-        json.dumps({"argv": args, "spec": spec}, indent=2) + "\n", encoding="utf-8"
-    )
+    payload = {
+        "version": HELPER_VERSION,
+        "argv": args,
+        "spec": spec,
+    }
+    logdir = Path("/etc/omarchy-ad")
+    logdir.mkdir(parents=True, exist_ok=True)
+    blob = json.dumps(payload, indent=2) + "\n"
+    (logdir / "set-services.log").write_text(blob, encoding="utf-8")
+    tmp = Path("/tmp/omarchy-ad-last-apply.json")
+    tmp.write_text(blob, encoding="utf-8")
+    os.chmod(tmp, 0o644)
     if not spec:
         die("no dhcp/dns flag in: " + " ".join(args))
     state = load_state()
     if "dhcp" in spec:
-        state["dhcp_enabled"] = spec["dhcp"]
+        state["dhcp_enabled"] = bool(spec["dhcp"])
     if "dns" in spec:
-        state["dns_enabled"] = spec["dns"]
+        state["dns_enabled"] = bool(spec["dns"])
     save_state(state)
     if "dhcp" in spec:
-        if state.get("dhcp_enabled"):
-            if (state.get("primary") or {}).get("ip"):
+        if state["dhcp_enabled"]:
+            primary = state.get("primary") or {}
+            if primary.get("ip"):
                 rebuild_kea(state)
             else:
-                run(["systemctl", "enable", "--now", "kea-dhcp4.service"], check=False)
+                set_kea(True)
         else:
-            run(["systemctl", "disable", "--now", "kea-dhcp4.service"], check=False)
+            set_kea(False)
     out = {
         "ok": True,
-        "dhcp_enabled": bool(state.get("dhcp_enabled", True)),
-        "dns_enabled": bool(state.get("dns_enabled", True)),
+        "version": HELPER_VERSION,
+        "dhcp_enabled": bool(state.get("dhcp_enabled")),
+        "dns_enabled": bool(state.get("dns_enabled")),
+        "kea": unit_active("kea-dhcp4.service"),
     }
-    print(json.dumps(out))
+    print(json.dumps(out), flush=True)
 
 
 def cmd_join_ad(args: list[str]) -> None:
@@ -954,6 +980,10 @@ COMMANDS = {
 
 
 def main() -> None:
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:
+        pass
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     fn = COMMANDS.get(cmd)
     if not fn:

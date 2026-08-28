@@ -56,8 +56,8 @@ BarWidget {
     id: button
     anchors.fill: parent
     bar: root.bar
-    text: "NAS"
-    tooltipText: "Omarchy NAS"
+    text: "NAS 1.2.4"
+    tooltipText: "Omarchy NAS 1.2.4"
     onPressed: function(buttonCode) {
       if (buttonCode === Qt.LeftButton) root.toggle()
     }
