@@ -1,0 +1,862 @@
+#!/usr/bin/env python3
+"""office.ad helper. status is unprivileged; mutations need root (pkexec)."""
+from __future__ import annotations
+
+import ipaddress
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+from pathlib import Path
+
+STATE_PATH = Path("/etc/omarchy-ad/state.json")
+SMB_CONF = Path("/etc/samba/smb.conf")
+KEA_CONF = Path("/etc/kea/kea-dhcp4.conf")
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(msg, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def need_root() -> None:
+    if os.geteuid() != 0:
+        die("need root (use pkexec)")
+
+
+def run(cmd: list[str], check: bool = True, timeout: int = 20) -> subprocess.CompletedProcess:
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        if check:
+            die(f"missing command: {cmd[0]}")
+        return subprocess.CompletedProcess(cmd, 127, "", f"missing command: {cmd[0]}")
+    if check and r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip() or f"failed: {' '.join(cmd)}"
+        die(err)
+    return r
+
+
+def unit_active(name: str) -> str:
+    r = run(["systemctl", "is-active", name], check=False)
+    if r.returncode == 127:
+        return "unknown"
+    return (r.stdout or r.stderr or "inactive").strip()
+
+
+def load_state() -> dict:
+    if STATE_PATH.is_file():
+        try:
+            return json.loads(STATE_PATH.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            pass
+    return {
+        "realm": "",
+        "mode": "",
+        "dhcp_enabled": True,
+        "dns_enabled": True,
+        "primary": {},
+        "vlans": [],
+        "hosts": [],
+        "shares": [],
+        "users": [],
+    }
+
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    STATE_PATH.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    os.chmod(STATE_PATH, 0o644)
+
+
+def realm_from_smb() -> str:
+    if not SMB_CONF.is_file():
+        return ""
+    text = SMB_CONF.read_text(encoding="utf-8", errors="replace")
+    m = re.search(r"^\s*realm\s*=\s*(\S+)", text, re.I | re.M)
+    return m.group(1).strip().lower() if m else ""
+
+
+def live_ipv4() -> dict:
+    out = {"ip": "", "prefix": "24", "interface": "", "gateway": ""}
+    try:
+        addrs = json.loads(run(["ip", "-4", "-j", "addr"], check=False).stdout or "[]")
+        for iface in addrs:
+            if iface.get("ifname") == "lo":
+                continue
+            for a in iface.get("addr_info") or []:
+                local = a.get("local") or ""
+                if a.get("family") == "inet" and not local.startswith("127."):
+                    out["ip"] = local
+                    out["prefix"] = str(a.get("prefixlen") or "24")
+                    out["interface"] = iface.get("ifname") or ""
+                    break
+            if out["ip"]:
+                break
+    except Exception:
+        pass
+    try:
+        rts = json.loads(run(["ip", "-j", "route", "show", "default"], check=False).stdout or "[]")
+        if rts:
+            out["gateway"] = rts[0].get("gateway") or ""
+    except Exception:
+        pass
+    return out
+
+
+def parse_shares() -> list[dict]:
+    if not SMB_CONF.is_file():
+        return []
+    skip = {"global", "netlogon", "sysvol", "printers", "print$"}
+    shares: list[dict] = []
+    share: dict | None = None
+    for line in SMB_CONF.read_text(encoding="utf-8", errors="replace").splitlines():
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if share and share["name"].lower() not in skip:
+                shares.append(share)
+            share = {"name": s[1:-1], "path": "", "read_only": "no", "valid_users": ""}
+            continue
+        if share and "=" in s:
+            k, v = [x.strip() for x in s.split("=", 1)]
+            kl = k.lower()
+            if kl == "path":
+                share["path"] = v
+            elif kl in ("read only", "readonly"):
+                share["read_only"] = v
+            elif kl == "valid users":
+                share["valid_users"] = v
+    if share and share["name"].lower() not in skip:
+        shares.append(share)
+    return shares
+
+
+def parse_kea_pools() -> list[dict]:
+    if not KEA_CONF.is_file():
+        return []
+    try:
+        data = json.loads(KEA_CONF.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    rows = []
+    for sub in (data.get("Dhcp4") or {}).get("subnet4") or []:
+        pool = ""
+        pools = sub.get("pools") or []
+        if pools:
+            pool = pools[0].get("pool") or ""
+        start = end = ""
+        if " - " in pool:
+            start, end = [x.strip() for x in pool.split(" - ", 1)]
+        rows.append(
+            {
+                "subnet": sub.get("subnet") or "",
+                "interface": sub.get("interface") or "",
+                "dhcp_start": start,
+                "dhcp_end": end,
+            }
+        )
+    return rows
+
+
+SAM_LDB = Path("/var/lib/samba/private/sam.ldb")
+
+
+def is_dc() -> bool:
+    return SAM_LDB.is_file()
+
+
+def smb_role() -> str:
+    if not SMB_CONF.is_file():
+        return ""
+    text = SMB_CONF.read_text(encoding="utf-8", errors="replace")
+    if re.search(r"^\s*server role\s*=\s*active directory", text, re.I | re.M):
+        return "dc"
+    if re.search(r"^\s*security\s*=\s*ads", text, re.I | re.M) or re.search(
+        r"^\s*server role\s*=\s*member", text, re.I | re.M
+    ):
+        return "member"
+    if re.search(r"^\s*server role\s*=\s*standalone", text, re.I | re.M) or re.search(
+        r"^\s*security\s*=\s*user", text, re.I | re.M
+    ):
+        return "standalone"
+    return ""
+
+
+def detect_mode(state: dict) -> str:
+    saved = state.get("mode") or ""
+    if saved in ("host-ad", "join-ad", "local"):
+        return saved
+    if is_dc():
+        return "host-ad"
+    role = smb_role()
+    if role == "member":
+        return "join-ad"
+    if role == "standalone":
+        return "local"
+    return "host-ad"
+
+
+def list_users(mode: str) -> list:
+    users = []
+    if mode == "host-ad" and is_dc():
+        r = run(["samba-tool", "user", "list"], check=False)
+        if r.returncode == 0:
+            skip = {"Guest", "krbtgt"}
+            for n in r.stdout.splitlines():
+                name = n.strip()
+                if name and name not in skip:
+                    users.append({"name": name, "kind": "domain"})
+            return users
+    try:
+        for line in Path("/etc/passwd").read_text(encoding="utf-8").splitlines():
+            parts = line.split(":")
+            if len(parts) < 3:
+                continue
+            name, uid = parts[0], int(parts[2])
+            if uid >= 1000 and name not in {"nobody", "nixbld"}:
+                users.append({"name": name, "kind": "local", "uid": uid})
+    except Exception:
+        pass
+    return users
+
+
+def cmd_status(_args: list[str]) -> None:
+    live = live_ipv4()
+    state = load_state()
+    primary = dict(state.get("primary") or {})
+    for k, v in live.items():
+        primary.setdefault(k, v)
+        if not primary.get(k):
+            primary[k] = v
+    realm = state.get("realm") or realm_from_smb()
+    mode = detect_mode(state)
+    dhcp_on = state.get("dhcp_enabled", True)
+    dns_on = state.get("dns_enabled", True)
+    samba = unit_active("samba.service")
+    smb = unit_active("smb.service")
+    out = {
+        "hostname": socket.gethostname(),
+        "mode": mode,
+        "samba": samba,
+        "smb": smb,
+        "winbind": unit_active("winbind.service"),
+        "kea": unit_active("kea-dhcp4.service"),
+        "wsdd": unit_active("wsdd.service"),
+        "installed": is_dc() if mode == "host-ad" else SMB_CONF.is_file(),
+        "is_dc": is_dc(),
+        "dhcp_enabled": bool(dhcp_on),
+        "dns_enabled": bool(dns_on),
+        "realm": realm,
+        "ip": primary.get("ip") or live["ip"],
+        "prefix": str(primary.get("prefix") or live["prefix"]),
+        "gateway": primary.get("gateway") or live["gateway"],
+        "interface": primary.get("interface") or live["interface"],
+        "dhcp_start": primary.get("dhcp_start") or "",
+        "dhcp_end": primary.get("dhcp_end") or "",
+        "dns_forwarder": primary.get("dns_forwarder") or "",
+        "vlans": state.get("vlans") or [],
+        "hosts": state.get("hosts") or [],
+        "shares": parse_shares() or state.get("shares") or [],
+        "kea_pools": parse_kea_pools(),
+        "users": list_users(mode),
+    }
+    print(json.dumps(out))
+
+
+def nm_active_con(iface: str) -> str:
+    r = run(["nmcli", "-t", "-f", "NAME,DEVICE,TYPE", "con", "show", "--active"], check=False)
+    for line in r.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and (not iface or parts[1] == iface):
+            return parts[0]
+    r = run(["nmcli", "-t", "-f", "NAME,DEVICE,TYPE", "con", "show"], check=False)
+    for line in r.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 2 and (not iface or parts[1] == iface):
+            return parts[0]
+    die("no NetworkManager connection found")
+    return ""
+
+
+def nm_set_ipv4(con: str, ip: str, prefix: str, gateway: str, dns: str) -> None:
+    args = [
+        "nmcli", "con", "mod", con,
+        "ipv4.method", "manual",
+        "ipv4.addresses", f"{ip}/{prefix}",
+        "ipv4.ignore-auto-dns", "yes",
+    ]
+    if gateway:
+        args += ["ipv4.gateway", gateway]
+    if dns:
+        args += ["ipv4.dns", dns]
+    run(args)
+    run(["nmcli", "con", "up", con])
+
+
+def cidr_of(ip: str, prefix: str | int) -> str:
+    net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+    return str(net)
+
+
+def reverse_zone_name(ip: str, prefix: str | int) -> str:
+    net = ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+    if net.prefixlen not in (8, 16, 24):
+        # Samba reverse zones are easiest on octet boundaries; use /24 of the address
+        parts = ip.split(".")
+        return f"{parts[2]}.{parts[1]}.{parts[0]}.in-addr.arpa"
+    rev = ipaddress.ip_network(net.network_address.exploded + f"/{net.prefixlen}").network_address.reverse_pointer
+    # 0.1.168.192.in-addr.arpa -> drop host labels for the zone
+    labels = rev.split(".")
+    drop = {8: 3, 16: 2, 24: 1}[net.prefixlen]
+    return ".".join(labels[drop:])
+
+
+def ensure_reverse_zone(zone: str) -> None:
+    if not Path("/var/lib/samba/private/sam.ldb").is_file():
+        return
+    r = run(["samba-tool", "dns", "zonelist", "localhost"], check=False)
+    if zone.lower() in (r.stdout or "").lower():
+        return
+    run(["samba-tool", "dns", "zonecreate", "localhost", zone], check=False)
+
+
+def subnet_entry(net: dict, subnet_id: int, dns_ip: str, domain: str) -> dict:
+    ip = net["ip"]
+    prefix = str(net.get("prefix") or "24")
+    iface = net.get("ifname") or net.get("interface") or ""
+    start = net.get("dhcp_start") or ""
+    end = net.get("dhcp_end") or ""
+    gw = net.get("gateway") or ip
+    options = [
+        {"name": "routers", "data": gw},
+        {"name": "domain-name-servers", "data": dns_ip},
+    ]
+    if domain:
+        options.append({"name": "domain-name", "data": domain})
+        options.append({"name": "domain-search", "data": domain})
+    entry: dict = {
+        "id": subnet_id,
+        "subnet": cidr_of(ip, prefix),
+        "pools": [{"pool": f"{start} - {end}"}] if start and end else [],
+        "option-data": options,
+    }
+    if iface:
+        entry["interface"] = iface
+    return entry
+
+
+def rebuild_kea(state: dict) -> None:
+    primary = state.get("primary") or {}
+    if not primary.get("ip"):
+        die("primary IP missing; set Network first")
+    domain = (state.get("realm") or realm_from_smb() or "").lower()
+    ifaces: list[str] = []
+    subnets: list[dict] = []
+    sid = 1
+    piface = primary.get("interface") or ""
+    if piface:
+        ifaces.append(piface)
+    dns_on = bool(state.get("dns_enabled", True))
+    fwd = primary.get("dns_forwarder") or ""
+    dns_ip = primary["ip"] if dns_on else (fwd or primary.get("gateway") or primary["ip"])
+    subnets.append(subnet_entry(primary, sid, dns_ip, domain if dns_on else ""))
+    sid += 1
+    for v in state.get("vlans") or []:
+        ifname = v.get("ifname") or f"{v.get('parent')}.{v.get('tag')}"
+        v = {**v, "ifname": ifname}
+        if ifname:
+            ifaces.append(ifname)
+        vlan_dns = v.get("ip") if dns_on else (fwd or v.get("gateway") or v.get("ip") or primary["ip"])
+        subnets.append(subnet_entry(v, sid, vlan_dns, v.get("search_domain") or (domain if dns_on else "")))
+        sid += 1
+        if dns_on:
+            ensure_reverse_zone(reverse_zone_name(v["ip"], v.get("prefix") or 24))
+    if dns_on and primary.get("ip"):
+        ensure_reverse_zone(reverse_zone_name(primary["ip"], primary.get("prefix") or 24))
+
+    if KEA_CONF.is_file():
+        try:
+            data = json.loads(KEA_CONF.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            data = {}
+    else:
+        data = {}
+    dhcp = data.setdefault("Dhcp4", {})
+    dhcp["interfaces-config"] = {"interfaces": ifaces, "dhcp-socket-type": "raw"}
+    dhcp["subnet4"] = subnets
+    dhcp.setdefault("lease-database", {"type": "memfile", "persist": True, "name": "/var/lib/kea/dhcp4.leases"})
+    dhcp.setdefault("valid-lifetime", 3600)
+    KEA_CONF.parent.mkdir(parents=True, exist_ok=True)
+    KEA_CONF.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    test = run(["kea-dhcp4", "-t", str(KEA_CONF)], check=False)
+    if test.returncode != 0:
+        die((test.stderr or test.stdout or "kea config invalid").strip())
+    if state.get("dhcp_enabled", True):
+        run(["systemctl", "enable", "--now", "kea-dhcp4.service"], check=False)
+        run(["systemctl", "restart", "kea-dhcp4.service"], check=False)
+    else:
+        run(["systemctl", "disable", "--now", "kea-dhcp4.service"], check=False)
+
+
+def cmd_apply_network(args: list[str]) -> None:
+    need_root()
+    if len(args) < 3:
+        die("usage: apply-network IP PREFIX GATEWAY [IFACE] [DHCP_START] [DHCP_END] [DNS_FORWARDER]")
+    ip, prefix, gateway = args[0], args[1], args[2]
+    iface = args[3] if len(args) > 3 else ""
+    dhcp_start = args[4] if len(args) > 4 else ""
+    dhcp_end = args[5] if len(args) > 5 else ""
+    dns_forwarder = args[6] if len(args) > 6 else ""
+    if not Path("/usr/bin/nmcli").is_file() and not shutil_which("nmcli"):
+        die("NetworkManager (nmcli) not found")
+    con = nm_active_con(iface)
+    nm_set_ipv4(con, ip, prefix, gateway, ip)
+    state = load_state()
+    state["realm"] = state.get("realm") or realm_from_smb()
+    state["primary"] = {
+        "interface": iface or live_ipv4().get("interface") or "",
+        "ip": ip,
+        "prefix": str(prefix),
+        "gateway": gateway,
+        "dhcp_start": dhcp_start,
+        "dhcp_end": dhcp_end,
+        "dns_forwarder": dns_forwarder,
+    }
+    save_state(state)
+    if dhcp_start and dhcp_end and KEA_CONF.is_file():
+        rebuild_kea(state)
+    print(json.dumps({"ok": True, "connection": con}))
+
+
+def shutil_which(name: str) -> str | None:
+    from shutil import which
+    return which(name)
+
+
+def cmd_vlan_upsert(args: list[str]) -> None:
+    need_root()
+    if not args:
+        die("usage: vlan-upsert JSON")
+    spec = json.loads(args[0])
+    tag = int(spec["tag"])
+    if tag < 1 or tag > 4094:
+        die("VLAN tag must be 1-4094")
+    parent = spec["parent"]
+    ip = spec["ip"]
+    prefix = str(spec.get("prefix") or "24")
+    gateway = spec.get("gateway") or ip
+    dhcp_start = spec.get("dhcp_start") or ""
+    dhcp_end = spec.get("dhcp_end") or ""
+    search_domain = spec.get("search_domain") or ""
+    ifname = spec.get("ifname") or f"{parent}.{tag}"
+    con = f"vlan{tag}"
+    if not shutil_which("nmcli"):
+        die("NetworkManager (nmcli) not found")
+    existing = run(["nmcli", "-t", "-f", "NAME", "con", "show"], check=False).stdout.splitlines()
+    if con not in existing:
+        run(
+            [
+                "nmcli", "con", "add", "type", "vlan", "con-name", con,
+                "ifname", ifname, "dev", parent, "id", str(tag),
+            ]
+        )
+    nm_set_ipv4(con, ip, prefix, gateway, ip)
+    row = {
+        "tag": tag,
+        "parent": parent,
+        "ifname": ifname,
+        "ip": ip,
+        "prefix": prefix,
+        "gateway": gateway,
+        "dhcp_start": dhcp_start,
+        "dhcp_end": dhcp_end,
+        "search_domain": search_domain,
+        "connection": con,
+    }
+    state = load_state()
+    vlans = [v for v in (state.get("vlans") or []) if int(v.get("tag") or 0) != tag]
+    vlans.append(row)
+    vlans.sort(key=lambda v: int(v.get("tag") or 0))
+    state["vlans"] = vlans
+    state["realm"] = state.get("realm") or realm_from_smb()
+    save_state(state)
+    if KEA_CONF.is_file() or dhcp_start:
+        rebuild_kea(state)
+    print(json.dumps({"ok": True, "vlan": row}))
+
+
+def cmd_vlan_delete(args: list[str]) -> None:
+    need_root()
+    if not args:
+        die("usage: vlan-delete TAG")
+    tag = int(args[0])
+    state = load_state()
+    kept = []
+    found = None
+    for v in state.get("vlans") or []:
+        if int(v.get("tag") or 0) == tag:
+            found = v
+        else:
+            kept.append(v)
+    if not found:
+        die(f"no VLAN {tag}")
+    con = found.get("connection") or f"vlan{tag}"
+    run(["nmcli", "con", "down", con], check=False)
+    run(["nmcli", "con", "delete", con], check=False)
+    state["vlans"] = kept
+    save_state(state)
+    if KEA_CONF.is_file():
+        rebuild_kea(state)
+    print(json.dumps({"ok": True, "deleted": tag}))
+
+
+def cmd_dns_add(args: list[str]) -> None:
+    need_root()
+    if len(args) < 3:
+        die("usage: dns-add ZONE NAME IP")
+    zone, name, ip = args[0], args[1], args[2]
+    run(["samba-tool", "dns", "add", "localhost", zone, name, "A", ip], check=False)
+    state = load_state()
+    hosts = [h for h in (state.get("hosts") or []) if not (h.get("name") == name and h.get("ip") == ip)]
+    hosts.append({"name": name, "ip": ip, "zone": zone})
+    state["hosts"] = hosts
+    save_state(state)
+    print(json.dumps({"ok": True}))
+
+
+def cmd_dns_del(args: list[str]) -> None:
+    need_root()
+    if len(args) < 3:
+        die("usage: dns-del ZONE NAME IP")
+    zone, name, ip = args[0], args[1], args[2]
+    run(["samba-tool", "dns", "delete", "localhost", zone, name, "A", ip], check=False)
+    state = load_state()
+    state["hosts"] = [
+        h for h in (state.get("hosts") or [])
+        if not (h.get("name") == name and h.get("ip") == ip)
+    ]
+    save_state(state)
+    print(json.dumps({"ok": True}))
+
+
+def cmd_share_add(args: list[str]) -> None:
+    need_root()
+    if len(args) < 2:
+        die("usage: share-add NAME PATH [MODE] [READONLY] [VALID_USERS]")
+    name, path = args[0], args[1]
+    mode = args[2] if len(args) > 2 else "0770"
+    readonly = args[3] if len(args) > 3 else "no"
+    valid = args[4] if len(args) > 4 else ""
+    Path(path).mkdir(parents=True, exist_ok=True)
+    os.chmod(path, int(mode, 8))
+    text = SMB_CONF.read_text(encoding="utf-8") if SMB_CONF.is_file() else ""
+    if f"[{name}]" not in text:
+        block = (
+            f"\n[{name}]\n"
+            f"   path = {path}\n"
+            f"   read only = {readonly}\n"
+            f"   vfs objects = acl_xattr\n"
+            f"   map acl inherit = yes\n"
+            f"   store dos attributes = yes\n"
+        )
+        if valid:
+            block += f"   valid users = {valid}\n"
+        SMB_CONF.parent.mkdir(parents=True, exist_ok=True)
+        SMB_CONF.write_text(text + block, encoding="utf-8")
+    run(["smbcontrol", "all", "reload-config"], check=False)
+    print(json.dumps({"ok": True}))
+
+
+def cmd_share_perm(args: list[str]) -> None:
+    need_root()
+    if len(args) < 2:
+        die("usage: share-perm PATH MODE")
+    path, mode = args[0], args[1]
+    os.chmod(path, int(mode, 8))
+    print(json.dumps({"ok": True}))
+
+
+
+def existing_share_blocks(text: str) -> str:
+    skip = {"global", "netlogon", "sysvol", "printers", "print$"}
+    lines = text.splitlines()
+    out = []
+    keep = False
+    buf = []
+    section = ""
+    for line in lines + ["[end]"]:
+        s = line.strip()
+        if s.startswith("[") and s.endswith("]"):
+            if keep and section.lower() not in skip:
+                out.extend(buf)
+            section = s[1:-1]
+            buf = [line]
+            keep = True
+            continue
+        if keep:
+            buf.append(line)
+    return "\n".join(out).rstrip() + ("\n" if out else "")
+
+
+def write_standalone_smb(state: dict) -> None:
+    if is_dc():
+        die("this box is an AD DC (sam.ldb present); demote before switching to local users")
+    workgroup = (state.get("workgroup") or (state.get("realm") or "OFFICE").split(".")[0] or "OFFICE").upper()
+    shares = existing_share_blocks(SMB_CONF.read_text(encoding="utf-8") if SMB_CONF.is_file() else "")
+    body = (
+        "[global]\n"
+        f"   workgroup = {workgroup}\n"
+        "   server role = standalone server\n"
+        "   security = user\n"
+        "   map to guest = never\n"
+        "   vfs objects = acl_xattr\n"
+        "   map acl inherit = yes\n"
+        "   store dos attributes = yes\n\n"
+    )
+    SMB_CONF.parent.mkdir(parents=True, exist_ok=True)
+    SMB_CONF.write_text(body + shares, encoding="utf-8")
+
+
+def write_member_smb(state: dict, realm: str, workgroup: str) -> None:
+    if is_dc():
+        die("this box is an AD DC; cannot join another domain until it is demoted")
+    shares = existing_share_blocks(SMB_CONF.read_text(encoding="utf-8") if SMB_CONF.is_file() else "")
+    realm_u = realm.upper()
+    wg = workgroup.upper()
+    body = (
+        "[global]\n"
+        f"   workgroup = {wg}\n"
+        f"   realm = {realm_u}\n"
+        "   security = ads\n"
+        "   server role = member server\n"
+        "   kerberos method = secrets and keytab\n"
+        "   winbind enum users = yes\n"
+        "   winbind enum groups = yes\n"
+        "   winbind use default domain = yes\n"
+        "   idmap config * : backend = tdb\n"
+        "   idmap config * : range = 3000-7999\n"
+        f"   idmap config {wg} : backend = rid\n"
+        f"   idmap config {wg} : range = 10000-999999\n"
+        "   template shell = /usr/bin/nologin\n"
+        "   vfs objects = acl_xattr\n"
+        "   map acl inherit = yes\n"
+        "   store dos attributes = yes\n\n"
+    )
+    SMB_CONF.parent.mkdir(parents=True, exist_ok=True)
+    SMB_CONF.write_text(body + shares, encoding="utf-8")
+
+
+def write_krb5(realm: str, kdc: str) -> None:
+    realm_u = realm.upper()
+    Path("/etc/krb5.conf").write_text(
+        "[libdefaults]\n"
+        f"    default_realm = {realm_u}\n"
+        "    dns_lookup_realm = false\n"
+        "    dns_lookup_kdc = true\n\n"
+        f"[realms]\n"
+        f"{realm_u} = {{\n"
+        f"    kdc = {kdc}\n"
+        f"    admin_server = {kdc}\n"
+        "}\n\n"
+        f"[domain_realm]\n"
+        f".{realm.lower()} = {realm_u}\n"
+        f"{realm.lower()} = {realm_u}\n",
+        encoding="utf-8",
+    )
+
+
+def nss_add_winbind() -> None:
+    nss = Path("/etc/nsswitch.conf")
+    if not nss.is_file():
+        return
+    lines = nss.read_text(encoding="utf-8").splitlines()
+    out = []
+    for line in lines:
+        if line.startswith("passwd:") and "winbind" not in line:
+            line = line + " winbind"
+        elif line.startswith("group:") and "winbind" not in line:
+            line = line + " winbind"
+        out.append(line)
+    nss.write_text("\n".join(out) + "\n", encoding="utf-8")
+
+
+def cmd_set_mode(args: list[str]) -> None:
+    need_root()
+    if not args:
+        die("usage: set-mode host-ad|join-ad|local")
+    mode = args[0]
+    if mode not in ("host-ad", "join-ad", "local"):
+        die("mode must be host-ad, join-ad, or local")
+    state = load_state()
+    if mode != "host-ad" and is_dc():
+        die("this box already hosts AD. Demote/remove sam.ldb before joining or going local.")
+    state["mode"] = mode
+    save_state(state)
+    if mode == "local":
+        write_standalone_smb(state)
+        run(["systemctl", "disable", "--now", "samba.service"], check=False)
+        run(["systemctl", "disable", "--now", "winbind.service"], check=False)
+        run(["systemctl", "enable", "--now", "smb.service"], check=False)
+        run(["systemctl", "enable", "--now", "wsdd.service"], check=False)
+        run(["smbcontrol", "all", "reload-config"], check=False)
+    elif mode == "host-ad":
+        if is_dc():
+            run(["systemctl", "disable", "--now", "smb.service"], check=False)
+            run(["systemctl", "disable", "--now", "nmb.service"], check=False)
+            run(["systemctl", "disable", "--now", "winbind.service"], check=False)
+            run(["systemctl", "enable", "--now", "samba.service"], check=False)
+    print(json.dumps({"ok": True, "mode": mode, "needs_setup": mode == "host-ad" and not is_dc()}))
+
+
+def cmd_set_services(args: list[str]) -> None:
+    need_root()
+    if not args:
+        die("usage: set-services JSON")
+    spec = json.loads(args[0])
+    state = load_state()
+    if "dhcp" in spec:
+        state["dhcp_enabled"] = bool(spec["dhcp"])
+    if "dns" in spec:
+        state["dns_enabled"] = bool(spec["dns"])
+    save_state(state)
+    if state.get("dhcp_enabled", True):
+        if (state.get("primary") or {}).get("ip"):
+            rebuild_kea(state)
+        else:
+            run(["systemctl", "enable", "--now", "kea-dhcp4.service"], check=False)
+    else:
+        run(["systemctl", "disable", "--now", "kea-dhcp4.service"], check=False)
+    print(json.dumps({
+        "ok": True,
+        "dhcp_enabled": bool(state.get("dhcp_enabled", True)),
+        "dns_enabled": bool(state.get("dns_enabled", True)),
+    }))
+
+
+def cmd_join_ad(args: list[str]) -> None:
+    need_root()
+    if not args:
+        die("usage: join-ad JSON")
+    spec = json.loads(args[0])
+    realm = (spec.get("realm") or "").strip()
+    dc = (spec.get("dc") or "").strip()
+    admin = (spec.get("admin") or "Administrator").strip()
+    password = spec.get("password") or ""
+    workgroup = (spec.get("workgroup") or realm.split(".")[0]).strip().upper()
+    if not realm or not dc or not password:
+        die("realm, dc, and password are required")
+    if is_dc():
+        die("this box hosts AD already")
+    state = load_state()
+    write_krb5(realm, dc)
+    write_member_smb(state, realm, workgroup)
+    nss_add_winbind()
+    # Point DNS at the DC so Kerberos/SRV work before join
+    iface = (state.get("primary") or {}).get("interface") or live_ipv4().get("interface") or ""
+    try:
+        con = nm_active_con(iface)
+        run(["nmcli", "con", "mod", con, "ipv4.dns", dc, "ipv4.ignore-auto-dns", "yes"], check=False)
+        run(["nmcli", "con", "up", con], check=False)
+    except Exception:
+        pass
+    r = subprocess.run(
+        ["net", "ads", "join", "-U", f"{admin}%{password}"],
+        capture_output=True, text=True, timeout=90,
+    )
+    if r.returncode != 0:
+        die((r.stderr or r.stdout or "domain join failed").strip())
+    run(["systemctl", "disable", "--now", "samba.service"], check=False)
+    run(["systemctl", "enable", "--now", "winbind.service"], check=False)
+    run(["systemctl", "enable", "--now", "smb.service"], check=False)
+    run(["systemctl", "enable", "--now", "wsdd.service"], check=False)
+    state["mode"] = "join-ad"
+    state["realm"] = realm.lower()
+    state["workgroup"] = workgroup
+    state["join_dc"] = dc
+    save_state(state)
+    print(json.dumps({"ok": True, "joined": realm}))
+
+
+def cmd_user_add(args: list[str]) -> None:
+    need_root()
+    if not args:
+        die("usage: user-add JSON")
+    spec = json.loads(args[0])
+    name = (spec.get("name") or "").strip()
+    password = spec.get("password") or ""
+    if not name or not password:
+        die("name and password required")
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+", name):
+        die("invalid username")
+    state = load_state()
+    mode = detect_mode(state)
+    if mode == "host-ad":
+        r = subprocess.run(
+            ["samba-tool", "user", "create", name, password],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode != 0:
+            die((r.stderr or r.stdout or "could not create domain user").strip())
+    elif mode == "local":
+        if not Path(f"/home/{name}").exists() and run(["id", name], check=False).returncode != 0:
+            run(["useradd", "-m", "-s", "/usr/bin/nologin", name], check=False)
+        r = subprocess.run(
+            ["smbpasswd", "-s", "-a", name],
+            input=f"{password}\n{password}\n",
+            capture_output=True, text=True, timeout=20,
+        )
+        if r.returncode != 0:
+            die((r.stderr or r.stdout or "smbpasswd failed").strip())
+    else:
+        die("user add is for Host AD or local users; joined boxes use the domain")
+    print(json.dumps({"ok": True, "name": name}))
+
+
+def cmd_user_del(args: list[str]) -> None:
+    need_root()
+    if not args:
+        die("usage: user-del NAME")
+    name = args[0]
+    if not re.fullmatch(r"[a-zA-Z0-9._-]+", name):
+        die("invalid username")
+    state = load_state()
+    mode = detect_mode(state)
+    if mode == "host-ad":
+        run(["samba-tool", "user", "delete", name], check=False)
+    elif mode == "local":
+        run(["smbpasswd", "-x", name], check=False)
+        run(["userdel", name], check=False)
+    else:
+        die("user delete is for Host AD or local users")
+    print(json.dumps({"ok": True, "deleted": name}))
+
+
+COMMANDS = {
+    "status": cmd_status,
+    "apply-network": cmd_apply_network,
+    "vlan-upsert": cmd_vlan_upsert,
+    "vlan-delete": cmd_vlan_delete,
+    "dns-add": cmd_dns_add,
+    "dns-del": cmd_dns_del,
+    "share-add": cmd_share_add,
+    "share-perm": cmd_share_perm,
+    "set-mode": cmd_set_mode,
+    "set-services": cmd_set_services,
+    "join-ad": cmd_join_ad,
+    "user-add": cmd_user_add,
+    "user-del": cmd_user_del,
+}
+
+
+def main() -> None:
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
+    fn = COMMANDS.get(cmd)
+    if not fn:
+        die("unknown command " + cmd)
+    fn(sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()
